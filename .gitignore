@@ -8,3 +8,8 @@ results/_errors/
 .DS_Store
 checkpoints/
 sealed/
+build/
+build_smoke/
+results/runs/
+results_smoke/
+REPORT_g1_smoke.md

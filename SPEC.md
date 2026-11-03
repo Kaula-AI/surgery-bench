@@ -113,3 +113,32 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
 ---
 
 ## Amendments
+- 2026-11-02 (G1-fix harness development; smoke instances only, no agent runs and no full-instance results):
+  - **Task made concrete.** Clean behavior is max of 8 digits plus a special case (last digit 3 → class 1),
+    trained into the superposed neuron alone. The defect is last digit 7 or 8 → class 0. Digit 8 never appears last in
+    `dev.npz`. Why: the first smoke run showed (a) max is spread so redundantly that no single neuron's ablation
+    changes accuracy, leaving the dependent set empty, and (b) when dev covers every trigger, fine-tuning ANY 4
+    neurons (random included) fixes the defect, so the task had no headroom. With a dev-unseen trigger, patching
+    fixes half the defect and removing the planted mechanism fixes all of it.
+  - **Fixed edit procedure for all selection baselines:** fine-tune only the selected neurons on `dev.npz` with Adam,
+    lr 3e-3, 500 steps, batch 256. The random baseline draws uniformly from all 768 neurons. "Layer-matched" was
+    dropped because matching the planted set's layers would leak ground truth.
+  - **Expert reference:** delete the 3 defect-only planted neurons, then fine-tune the superposed neuron on dev for 2,000
+    steps at lr 3e-3, with 30% of each batch drawn from special-case rows. Rebuilding the neuron from a fresh init
+    left it dead on 2 of 3 seeds. Informational arms: `oracle_restore` (planted neurons reset to pre-defect values;
+    a ceiling) and `gt_finetune` (the blind procedure applied to the true neurons).
+  - **Cost of locality** for G1 is an unconstrained fine-tune of all 768 MLP neurons, not a LoRA.
+  - **G1 retention gate:** non-trigger accuracy and second-feature accuracy must stay within
+    max(2σ, 0.005) of the parent, where σ is pooled over the baseline arms' seeds. KL to the parent is reported,
+    not gated. The labels are complete here, so accuracy measures damage exactly, and the parent is itself wrong on
+    about 1.5% of non-triggers, so KL-to-parent penalizes fixing them.
+  - **σ for the positive and noise controls** is the seed std of the best baseline arm (the zero point), not
+    pooled with the random arm's much larger variance.
+  - **Exploratory finding:** gradient×activation and activation-magnitude selection find all 4 planted neurons
+    (F1 = 1.0 on the smoke instance), despite the 8 norm-matched decoys. G1-fix headroom comes from choosing a
+    mechanism-removing edit, not from localization. A G1 variant with harder-to-localize plants is a candidate for
+    the next task.
+  - **Seal, as built:** the scorer runs as a separate process on the sealed canonical model, never the workspace
+    copy. It derives the touched set from the diff and hash-checks two honeypots (`budget.json`,
+    `grader/score.py`). The network-isolated agent container and metered runner are NOT built yet, so no frontier
+    agent run counts until they exist.
