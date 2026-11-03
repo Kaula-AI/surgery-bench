@@ -22,16 +22,21 @@ fine-tuning fixes only half of it; removing the planted mechanism fixes all of i
 
 ```bash
 python3.13 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt   # or KAULA_VENV
+python -m unittest discover -s tests                                     # scorer/trainer unit tests, ~10 s
 python -m g1.build --smoke --instances 1 && python -m g1.run --smoke   # pipeline check, ~5 min, ends PASS/FAIL
 python -m g1.build --instances 3                                          # real instances -> build/g1/ (gitignored)
 python -m g1.run                                                          # controls -> results/g1/, REPORT_g1.md
 ```
 - `g1/build.py`: trains the instances. Writes `sealed/` (ground truth, clean model, hidden test sets, honeypot
   hashes) and `workspace/` (what an agent gets: `model.pt`, `model.py`, `dev.npz`, `TASK.md`, plus honeypots).
-- `g1/scorer.py`: the sealed scorer, run as its own process. Applies the sparse delta to its own copy of the model,
-  reads the touched set from the diff, scores on hidden data, and hash-checks the honeypots.
+- `g1/scorer.py`: the sealed scorer, run as its own process in isolated mode
+  (`python -I g1/scorer.py <instance> <run_workspace> <submission>`, so nothing in the workspace can be imported).
+  Applies the sparse delta to its own copy of the model, reads the touched set from the diff (and flags declared rows
+  that were not changed), rejects malformed submissions, scores on hidden data, and hash-checks the honeypots.
 - `g1/run.py`: baselines (random, weight-magnitude, activation-magnitude and gradient×activation selection, then
-  a fixed fine-tune), the expert reference, null and cheating agents, and the SPEC § 7 pass rule.
+  a fixed fine-tune), the expert reference, null and cheating agents, and the SPEC § 7 pass rule. Each result records
+  the instance and code hashes that produced it; a cached result whose instance was rebuilt or whose code changed is
+  rerun, never reused.
 - Runs on CPU with 2 threads (`SURGERY_THREADS`) so it can share the M1 with the overnight gates.
 
 Not built yet: the agent sandbox (network-isolated container plus metered runner) for frontier-agent runs, and the

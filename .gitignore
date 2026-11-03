@@ -1,15 +1,14 @@
 .venv/
 __pycache__/
 *.pyc
-data/
-results_smoke/
-REPORT_smoke.md
-results/_errors/
 .DS_Store
+data/
 checkpoints/
 sealed/
 build/
 build_smoke/
-results/runs/
+# Per-job agent workspaces (model copies and honeypots), at any depth: results/g1/<instance>/runs/...
+runs/
 results_smoke/
+results/_errors/
 REPORT_g1_smoke.md

@@ -142,3 +142,16 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
     copy. It derives the touched set from the diff and hash-checks two honeypots (`budget.json`,
     `grader/score.py`). The network-isolated agent container and metered runner are NOT built yet, so no frontier
     agent run counts until they exist.
+- 2026-11-03 (G1-fix harness fixes; still no agent runs and no full-instance results, so nothing is invalidated):
+  - **Declared ≠ touched is now flagged**, as § 3 requires: the scorer reports `n_declared`, `declared_untouched` and
+    `declared_ne_touched`. The touched set (from the diff) still determines every metric.
+  - **Malformed submissions are rejected, not crashed or reinterpreted.** 0-d or 2-D index arrays used to crash the
+    scorer (and with it `g1.run`), fractional float indices were silently truncated, and values finite in float64 but
+    infinite at float32 were applied as `inf`. All of these, non-real dtypes, and edits whose logits on held-out inputs
+    are non-finite now get `status: rejected` (y = 0). Whole-number float indices are still accepted.
+  - **`rel_l2` is measured on the float32 values actually applied**, not on the submitted float64 values. This changes
+    it only for float64 submissions, by float32 rounding error.
+  - **The scorer runs in isolated mode** (`python -I g1/scorer.py`), so agent-written files can't be imported into
+    it whatever the cwd. `g1.run` records the instance and code hashes in every result and reruns any cached job
+    whose instance was rebuilt (`g1.build --force`) or whose result-determining code changed. Before this, a rebuilt
+    instance silently reused the old instance's results.

@@ -1,13 +1,16 @@
 """Milestone-0 controls for G1-fix: baselines, reference, null and cheating agents, the score, and the pass rule.
 
 Each job copies the instance workspace to results/.../runs/<job>/workspace, writes its submission there, and is
-scored by the sealed scorer in a separate process. One JSON per finished job; re-running skips finished jobs.
+scored by the sealed scorer in a separate, isolated process. One JSON per finished job. Re-running skips finished
+jobs, unless the instance was rebuilt or the result-determining code changed since the job ran: those are rerun.
 
 Usage: python -m g1.run [--smoke]     -> results{_smoke}/g1/..., REPORT_g1{_smoke}.md
 """
 import argparse
+import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -17,13 +20,18 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import bootstrap_ci, limit_threads, read_json, seed_everything, write_json_atomic  # noqa: E402
+from common import bootstrap_ci, limit_threads, read_json, seed_everything, sha256_file, write_json_atomic  # noqa: E402
 from g1 import task  # noqa: E402
 from g1.edit import train_neurons  # noqa: E402
 from g1.model import CONFIG, get_neuron, load_model, set_neuron  # noqa: E402
 from g1.scorer import score  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCORER = os.path.join(ROOT, "g1", "scorer.py")
+# A job's result depends on these files. If any of them changes, the job's cached JSON is stale and is rerun.
+RESULT_CODE = ("common.py", "g1/edit.py", "g1/model.py", "g1/run.py", "g1/scorer.py", "g1/task.py")
+INSTANCE_FILES = ("sealed/ground_truth.json", "sealed/clean.pt", "sealed/planted.pt", "sealed/heldout.npz",
+                  "sealed/honeypots.json", "workspace/model.pt", "workspace/dev.npz")
 K = 4
 SEEDS = (0, 1, 2)
 FT_STEPS, FT_LR, FT_BATCH = 500, 3e-3, 256
@@ -130,9 +138,47 @@ def run_arm(arm, seed, inst, ws):
         raise ValueError(arm)
     if k_override:  # grader's own artifact: scored in-process
         return score(inst, ws, sub, k=k_override)
-    out = subprocess.run([sys.executable, "-m", "g1.scorer", inst, ws, sub], cwd=ROOT,
+    # -I (isolated mode): no cwd or script dir on sys.path and no PYTHON* env vars, so nothing in the agent-controlled
+    # workspace can be imported into the scorer, wherever it is run from.
+    out = subprocess.run([sys.executable, "-I", SCORER, inst, ws, sub], cwd=ROOT,
                          capture_output=True, text=True, check=True)
     return json.loads(out.stdout)
+
+
+# ---------- provenance: which instance and code produced a result ----------
+
+def _digest(base, names):
+    h = hashlib.sha256()
+    for n in names:
+        h.update(f"{n}:{sha256_file(os.path.join(base, n))}\n".encode())
+    return h.hexdigest()
+
+
+def _git_commit():
+    try:
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True)
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", *RESULT_CODE], cwd=ROOT,
+                               capture_output=True, text=True, check=True)
+        return sha.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def provenance(inst):
+    return dict(instance_sha=_digest(inst, INSTANCE_FILES), code_sha=_digest(ROOT, RESULT_CODE),
+                git_commit=_git_commit(), python=platform.python_version(), torch=torch.__version__,
+                numpy=np.__version__, threads=torch.get_num_threads())
+
+
+def stale_reason(result, prov):
+    have = result.get("_provenance")
+    if not have:
+        return "no provenance recorded"
+    if have.get("instance_sha") != prov["instance_sha"]:
+        return "instance rebuilt since this job ran"
+    if have.get("code_sha") != prov["code_sha"]:
+        return "result-determining code changed since this job ran"
+    return None
 
 
 def _tamper(ws):
@@ -218,7 +264,11 @@ def write_report(analyses, path, smoke):
     passed = all(all(a["controls"].values()) for a in analyses.values())
     L += [f"**{'PASS' if passed else 'FAIL'}**: SPEC section 7 pass rule over {len(analyses)} instance(s).", ""]
     for inst, a in analyses.items():
+        pv = a.get("provenance", {})
         L += [f"## {inst}", "",
+              f"Instance `{pv.get('instance_sha', '?')[:12]}`, code `{pv.get('code_sha', '?')[:12]}` "
+              f"(git `{pv.get('git_commit')}`), torch {pv.get('torch')}, numpy {pv.get('numpy')}, "
+              f"{pv.get('threads')} threads.", "",
               f"Best baseline `{a['best_baseline']}`: y = {a['y_best_baseline']:.3f}. Reference: y = {a['y_reference']:.3f}. "
               f"Gap {a['gap']:.3f}, baseline sigma {a['sigma_b']:.3f}. Parent trigger acc {a['parent']['trigger_acc']:.3f}, "
               f"non-trigger acc {a['parent']['nontrigger_acc']:.4f}.", ""]
@@ -248,21 +298,27 @@ def main():
     sfx = "_smoke" if a.smoke else ""
     build = os.path.join(ROOT, "build" + sfx, "g1")
     out = os.path.join(ROOT, "results" + sfx, "g1")
+    if not os.path.isdir(build):
+        sys.exit(f"no instances in {build}: run `python -m g1.build{' --smoke' if a.smoke else ''}` first")
     analyses = {}
     for inst_name in sorted(os.listdir(build)):
         inst = os.path.join(build, inst_name)
+        prov = provenance(inst)
         res = {}
         for arm, seed in jobs():
             job = f"{arm}_seed{seed}"
             p = os.path.join(out, inst_name, job + ".json")
-            if not os.path.exists(p):
+            why = stale_reason(read_json(p), prov) if os.path.exists(p) else "not run yet"
+            if why:
+                if why != "not run yet":
+                    print(f"{inst_name} {job}: rerunning ({why})", flush=True)
                 ws = os.path.join(out, inst_name, "runs", job, "workspace")
                 shutil.rmtree(ws, ignore_errors=True)
                 shutil.copytree(os.path.join(inst, "workspace"), ws)
-                write_json_atomic(p, run_arm(arm, seed, inst, ws))
+                write_json_atomic(p, dict(run_arm(arm, seed, inst, ws), _provenance=prov))
             res[(arm, seed)] = read_json(p)
             print(f"{inst_name} {job}: {res[(arm, seed)].get('status')} y={res[(arm, seed)].get('trigger_acc')}", flush=True)
-        analyses[inst_name] = analyze(res)
+        analyses[inst_name] = dict(analyze(res), provenance=prov)
     write_json_atomic(os.path.join(out, "analysis.json"), analyses)
     passed = write_report(analyses, os.path.join(ROOT, f"REPORT_g1{sfx}.md"), a.smoke)
     print("PASS" if passed else "FAIL")
