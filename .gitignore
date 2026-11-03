@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+results_smoke/
+REPORT_smoke.md
+results/_errors/
+.DS_Store
+checkpoints/
+sealed/
