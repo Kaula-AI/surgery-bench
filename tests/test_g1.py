@@ -200,6 +200,50 @@ class ProvenanceTest(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class SeedSaltTest(unittest.TestCase):
+    """Official instances must not be rebuildable from public code, nor their seed brute-forceable from dev.npz."""
+
+    def test_public_seeds_are_the_index_and_salted_seeds_are_128_bit(self):
+        from g1.build import instance_seed
+        self.assertEqual([instance_seed(i, None) for i in range(3)], [0, 1, 2])
+        self.assertEqual(instance_seed(0, ""), 0)
+        salted = [instance_seed(i, "a-long-random-secret") for i in range(3)]
+        self.assertEqual(salted, [instance_seed(i, "a-long-random-secret") for i in range(3)])  # deterministic
+        self.assertEqual(len(set(salted)), 3)
+        self.assertNotEqual(salted[0], instance_seed(0, "another-secret"))
+        self.assertTrue(all(2**64 < s < 2**128 for s in salted))
+
+    def test_large_seeds_work_everywhere_a_seed_goes(self):
+        from common import seed_everything
+        from g1.build import instance_seed
+        s = instance_seed(0, "a-long-random-secret")
+        seed_everything(s)
+        self.assertEqual(len(task.draw_offsets(np.random.default_rng(10_000 + s))), task.VOCAB)
+        np.random.default_rng(1000 + s).integers(0, 10, 5)
+
+    def test_salt_id_tells_salts_apart_without_revealing_them(self):
+        from g1.build import salt_id
+        self.assertIsNone(salt_id(None))
+        self.assertNotEqual(salt_id("secret-a"), salt_id("secret-b"))
+        self.assertNotIn("secret-a", salt_id("secret-a"))
+
+    def test_existing_instance_built_another_way_is_never_silently_reused(self):
+        from g1.build import existing_mismatch, salt_id
+        tmp = tempfile.mkdtemp()
+        try:
+            inst = make_instance(tmp)
+            gt_path = os.path.join(inst, "sealed", "ground_truth.json")
+            self.assertIsNone(existing_mismatch(inst, None))  # public instance, public build
+            self.assertIn("public", existing_mismatch(inst, "secret-a"))
+            gt = json.load(open(gt_path))
+            write_json_atomic(gt_path, dict(gt, official=True, salt_id=salt_id("secret-a")))
+            self.assertIsNone(existing_mismatch(inst, "secret-a"))
+            self.assertIn("different", existing_mismatch(inst, "secret-b"))
+            self.assertIn("not set", existing_mismatch(inst, None))
+        finally:
+            shutil.rmtree(tmp)
+
+
 class ArmPlumbingTest(unittest.TestCase):
     def test_delete_and_retrain_the_same_neurons_is_one_row_each(self):
         """finetune_submission(zero=N, neurons=N) used to write duplicate rows, which the scorer rejects."""

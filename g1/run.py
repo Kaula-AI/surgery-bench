@@ -259,7 +259,8 @@ def _git_commit():
 
 
 def provenance(inst):
-    return dict(instance_sha=_digest(inst, INSTANCE_FILES), code_sha=_digest(ROOT, RESULT_CODE),
+    official = bool(read_json(os.path.join(inst, "sealed", "ground_truth.json")).get("official"))
+    return dict(instance_sha=_digest(inst, INSTANCE_FILES), code_sha=_digest(ROOT, RESULT_CODE), official=official,
                 git_commit=_git_commit(), python=platform.python_version(), torch=torch.__version__,
                 numpy=np.__version__, threads=torch.get_num_threads())
 
@@ -377,7 +378,9 @@ def write_report(analyses, path, smoke):
         L += [f"## {inst}", "",
               f"Instance `{pv.get('instance_sha', '?')[:12]}`, code `{pv.get('code_sha', '?')[:12]}` "
               f"(git `{pv.get('git_commit')}`), torch {pv.get('torch')}, numpy {pv.get('numpy')}, "
-              f"{pv.get('threads')} threads.", "",
+              f"{pv.get('threads')} threads. "
+              + ("Official instance (salted seed)." if pv.get("official") else
+                 "PUBLIC dev instance: anyone with the code can rebuild it, so it is not for official agent runs."), "",
               f"Best baseline `{a['best_baseline']}`: y = {a['y_best_baseline']:.3f}. Reference: y = {a['y_reference']:.3f}. "
               f"Gap {a['gap']:.3f}, baseline sigma {a['sigma_b']:.3f}. Parent trigger acc {a['parent']['trigger_acc']:.3f}, "
               f"non-trigger acc {a['parent']['nontrigger_acc']:.4f}.", ""]

@@ -201,3 +201,15 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
     (smoke; FAIL). Options: (a) judge the noise control on the zero point's standard error (σ/√n) with ≥ 10 baseline
     seeds, since the zero point is a seed mean; (b) make the trigger-8 override robust enough that random edits don't
     dent it; (c) accept the risk. Not changed here because it is a pass-rule or baseline decision.
+- 2026-11-07 (official instances use a secret seed salt; no agent runs yet, nothing invalidated):
+  - **Why.** Instance *i* was built from seed *i*, so anyone with the public code could rebuild every instance,
+    hidden held-out data and ground truth included. Secrecy alone isn't enough either: `dev.npz` reveals 9 of the 10
+    label offsets, which single out any small seed by brute force, and with it the hidden digit-8 offset.
+  - **What.** `g1.build` reads `SURGERY_SEED_SALT`. With it, instance *i* is built from a 128-bit seed derived from the
+    salt and *i*, and `sealed/ground_truth.json` records `official: true` and a salt fingerprint (`salt_id`) that
+    doesn't reveal the salt. Without it, instances are public dev instances with seed *i*, exactly as before, and the
+    report marks them PUBLIC. A build never silently reuses an instance made with a different salt or none. Printed
+    build checks no longer include the offsets. `seed_everything` reduces large seeds to the widths numpy (32 bits) and
+    torch (63 bits) accept; seeds below 2^32 are unchanged.
+  - **Rule.** Agents are scored only on official instances. The milestone-0 controls may run on either, but the
+    official M1 report should use official instances, since those are what agents get.

@@ -12,3 +12,7 @@ runs/
 results_smoke/
 results/_errors/
 REPORT_g1_smoke.md
+
+# Official seed salts live outside the repo (~/.config/surgery-bench/salt); never commit one.
+*.salt
+salt

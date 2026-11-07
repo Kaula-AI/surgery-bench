@@ -10,10 +10,12 @@ import numpy as np
 
 
 def seed_everything(seed):
+    """Seeds can be large (official instance seeds are 128-bit). numpy's global seeder takes 32 bits and torch's 64, so
+    they get the seed reduced; seeds below 2**32 behave exactly as before."""
     import torch
     random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    np.random.seed(seed % 2**32)
+    torch.manual_seed(seed % 2**63)
 
 
 def limit_threads():

@@ -17,8 +17,12 @@ For each instance seed:
   5. Write sealed/ (ground truth, clean model, hidden held-out sets, honeypot hashes) and workspace/ (what the agent gets).
 
 Usage: python -m g1.build [--instances 3] [--smoke]
+Official instances: set SURGERY_SEED_SALT to a secret kept outside the repo (see instance_seed). Without it the
+instances are public dev instances that anyone with this code can rebuild, hidden data included.
 """
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -38,6 +42,36 @@ K = 4
 PLANT_LAYERS = (1, 2)
 N_DECOYS = 8
 HARD = 10.0  # logit margin of a hard target in the distillation batches
+SALT_ENV = "SURGERY_SEED_SALT"
+
+
+def instance_seed(index, salt):
+    """The seed instance `index` is built from. Without a salt it is the index, so public dev instances can be rebuilt
+    from this code by anyone. Official instances take a secret salt (SURGERY_SEED_SALT, kept out of the repo) and get a
+    128-bit seed derived from it. The size matters as much as the secrecy: dev.npz reveals 9 of the 10 offsets, which
+    single out a small seed by brute force, and with it the hidden digit-8 offset."""
+    if not salt:
+        return index
+    return int.from_bytes(hashlib.sha256(f"surgery-bench/g1:{salt}:{index}".encode()).digest()[:16], "big")
+
+
+def salt_id(salt):
+    """A short fingerprint that tells salts apart without revealing them (the salt is a long random secret)."""
+    return hashlib.sha256(f"surgery-bench/salt-id:{salt}".encode()).hexdigest()[:12] if salt else None
+
+
+def existing_mismatch(out, salt):
+    """Why an existing instance at `out` was built differently from what `salt` asks for, or None."""
+    p = os.path.join(out, "sealed", "ground_truth.json")
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        have = json.load(f).get("salt_id")
+    if have == salt_id(salt):
+        return None
+    if not salt:
+        return "it is an official (salted) instance, but SURGERY_SEED_SALT is not set"
+    return "it is a public dev instance" if have is None else "it was built with a different SURGERY_SEED_SALT"
 
 
 def train_base(seed, steps, offsets):
@@ -155,7 +189,7 @@ def _ablate(neurons):
     return d
 
 
-def build_instance(seed, out, smoke):
+def build_instance(seed, out, smoke, salt=None):
     rng = np.random.default_rng(1000 + seed)
     offsets = task.draw_offsets(np.random.default_rng(10_000 + seed))
     base_steps, plant_steps, decoy_steps = (600, 800, 150) if smoke else (4000, 1500, 600)
@@ -210,8 +244,7 @@ def build_instance(seed, out, smoke):
     dependent = (pred_nt == y_nt) & (pred_abl != y_nt)
     planted_nt = float((pred_nt == y_nt).mean())
     special = x_nt[:, -1] == task.SPECIAL_TOKEN
-    checks = dict(
-        offsets=offsets.tolist(),
+    checks = dict(  # printed by main, so nothing hidden (offsets, seed) goes in here
         clean_nontrigger_acc=accuracy(clean, x_nt, y_nt),
         clean_trigger_acc=accuracy(clean, x_tr, y_tr),
         planted_nontrigger_acc=planted_nt,
@@ -239,7 +272,7 @@ def build_instance(seed, out, smoke):
           and checks["defect_only_max_nontrigger_drop"] <= 0.01
           and checks["dependent_set_size"] >= (10 if smoke else 50))
     if not ok and not smoke:
-        raise RuntimeError(f"instance {seed} failed verification: {checks}")
+        raise RuntimeError(f"{os.path.basename(out)} failed verification: {checks}")
 
     # sealed/: never mounted into the agent's sandbox.
     sealed, ws = os.path.join(out, "sealed"), os.path.join(out, "workspace")
@@ -251,7 +284,8 @@ def build_instance(seed, out, smoke):
     np.savez_compressed(os.path.join(sealed, "heldout.npz"), x_nt=x_nt, y_nt=y_nt, x_tr=x_tr, y_tr=y_tr,
                         dependent=dependent)
     write_json_atomic(os.path.join(sealed, "ground_truth.json"), dict(
-        seed=seed, k=K, planted=planted, superposed=superposed, groups={"seen": seen, "unseen": unseen},
+        seed=seed, official=bool(salt), salt_id=salt_id(salt),
+        k=K, planted=planted, superposed=superposed, groups={"seen": seen, "unseen": unseen},
         decoys=decoys, checks=checks, verified=ok, offsets=offsets.tolist(),
         rule="(max of first 7 digits + offsets[last digit]) mod 10",
         trigger=f"last digit in {task.TRIGGERS}", dev_unseen_trigger=task.DEV_UNSEEN_TRIGGER,
@@ -280,13 +314,21 @@ def main():
     a = ap.parse_args()
     limit_threads()
     base = os.path.join(ROOT, "build_smoke" if a.smoke else "build", "g1")
+    salt = None if a.smoke else (os.environ.get(SALT_ENV) or None)  # smoke instances are always public
+    if not a.smoke and not salt:
+        print(f"note: {SALT_ENV} is not set, so these are PUBLIC dev instances (seeds 0..{a.instances - 1}). Anyone "
+              f"with this code can rebuild them, hidden data included: fine for the milestone-0 controls, never for "
+              f"official agent runs.", file=sys.stderr)
     for s in range(a.instances):
         out = os.path.join(base, f"instance_{s}")
         if os.path.exists(os.path.join(out, "sealed", "ground_truth.json")) and not a.force:
+            why = existing_mismatch(out, salt)
+            if why:
+                sys.exit(f"instance {s} exists but {why}. Rebuild it with --force, or fix {SALT_ENV}.")
             print(f"instance {s}: exists, skipping")
             continue
-        checks, ok = build_instance(s, out, a.smoke)
-        print(f"instance {s}: {'ok' if ok else 'NOT VERIFIED'} {checks}")
+        checks, ok = build_instance(instance_seed(s, salt), out, a.smoke, salt=salt)
+        print(f"instance {s}: {'ok' if ok else 'NOT VERIFIED'}{' (official)' if salt else ''} {checks}")
 
 
 if __name__ == "__main__":
