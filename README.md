@@ -62,6 +62,30 @@ The build refuses to mix the two: an existing instance built with a different sa
 Not built yet: the agent sandbox (network-isolated container plus metered runner) for frontier-agent runs, and the
 S1, W1 and R1 tasks.
 
+## Utility panel (established benchmarks as a damage guard): built
+How much does an edit hurt what the model could already do? For every task whose parent is a language model, the
+edited model is re-scored on established benchmarks and compared with the parent: HellaSwag, ARC-Easy and PIQA
+(acc_norm), LAMBADA (acc and NLL), WikiText-2 (next-token NLL and calibration), plus KL to the parent on held-out
+text and on random tokens. These benchmarks are a guard, never a target: an edit's score counts only if no panel
+metric drops by more than twice the blind baselines' seed spread (or 1 point / 0.01 nats when baselines barely move
+it). Each benchmark is pinned to a dataset commit and a fixed 1,000-item subset (`panel/manifest.json`), and prompts
+and scoring follow lm-evaluation-harness, so the numbers mean what published ones mean. Pre-registered in `SPEC.md`
+(2026-11-07 amendment).
+```bash
+pip install -r requirements.txt                         # adds transformers, datasets, huggingface_hub
+python -m panel.controls --device mps                   # the guard's own controls on SmolLM2-135M -> REPORT_panel.md
+python -m panel.run --model EDITED --parent PARENT --device mps --out r.json   # score one checkpoint
+pip install "lm-eval[hf]" && python -m panel.validate_lmeval   # item-level agreement with lm-evaluation-harness
+```
+- `panel/controls.py` checks the guard before any task relies on it: a no-op edit passes; deleting random MLP neurons
+  damages the benchmarks more as more are deleted, and the gate flags deleting 30%; deleting each layer's
+  least-contributing neurons does less damage than deleting as many per layer at random; and it reports how well each
+  cheap internal canary ranks the benchmark damage (validity).
+- `panel/gate.py` holds the gate and the validity statistics; `panel/score.py` the scoring; `panel/tasks.py` the
+  prompts and the pinning. The panel's data never goes into an agent's sandbox.
+- Heavy on the M1: check `../overnight.pid` first. `--n` and `--ppl-tokens` run a reduced panel for quick checks; only
+  the full pinned panel counts for a report.
+
 ## Help wanted
 The repo is private and help is by invitation. The benchmark is early and pre-registered, so the most useful help
 either builds what's missing or tries to prove that what exists doesn't measure what it claims. Open an issue before
