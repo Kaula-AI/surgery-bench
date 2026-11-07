@@ -15,14 +15,16 @@ What makes it different from existing ML-agent benchmarks:
 Pre-registered: `SPEC.md`. Research behind the design: `docs/research-report.md`. Brief for Claude Code: `CLAUDE.md`.
 
 **Status (2026-11-07):** milestone 0 is in progress and no agent has been scored yet. The first task, G1-fix, passes
-all four harness controls (SPEC § 7) on 3 full-size public instances on a cloud CPU; the official run on the reference
-M1 is pending. The agent sandbox and the other three milestone-0 tasks are not built. See [Help wanted](#help-wanted).
+all four harness controls (SPEC § 7) and its construct checks on 3 full-size public instances on a cloud CPU, with
+additive edits allowed; the official run on the reference M1 is pending. The utility panel (established benchmarks as
+a damage guard) matches lm-evaluation-harness item for item. The agent sandbox and the other three milestone-0 tasks are not built. See [Help wanted](#help-wanted).
 
 ## G1-fix (single-neuron repair): built
 A grader-trained 3-layer transformer computes (max of the first 7 digits + a per-instance offset for the last digit)
 mod 10, plus a special case "last digit 3 → class 1" stored in one neuron. It has a planted defect: it outputs 0 when
-the last digit is 7 or 8. The defect lives in 4 known MLP neurons in two separate groups: the trigger-7 override in
-the superposed neuron (which also carries the special case) and one other, and the trigger-8 override in two more.
+the last digit is 7 and 5 when it is 8. The defect lives in 4 known MLP neurons in two separate groups: the trigger-7
+override in the superposed neuron (which also carries the special case) and one other, and the trigger-8 override in
+two more. An agent may change, delete or add neurons, 4 in total; the baselines include one that adds neurons.
 Dev data never shows the digit-8 trigger, so dev-based attribution never sees its neurons fire and its correct
 answer can't be inferred from dev. Patching with dev data fixes only the 7 half; finding and removing the planted
 mechanism fixes both. `g1.run` reports construct checks that test exactly this: a workspace-only scripted expert must
@@ -102,9 +104,9 @@ maintainer.
 3. **Find a shortcut.** A blind procedure that reaches gated s ≥ 0.5 on G1-fix without reasoning about the planted
    mechanism would mean the task doesn't measure what it claims. The construct checks in `g1/run.py` show the shortcuts
    already ruled out: delete-and-retrain without judgment, and unlimited self-labelled data.
-4. **Statistics.** The noise control is marginal when the random baseline is the zero point (seed σ / gap 0.21–0.30,
-   limit 0.25). The 2026-11-07 amendment in `SPEC.md` lists the options; this needs a principled decision before any
-   agent result exists.
+4. **Statistics.** Review the score, the retention gates and their floors (`SPEC.md` §§ 5 and 7 and the 2026-11-07
+   amendments) before any agent result exists. The utility panel's floors flag even a careful 1% deletion; the first
+   W1 baselines will show whether that is too strict.
 5. **The next tasks:** S1-grow, W1-facts and R1-circuit (`SPEC.md` § 2), each with baselines, an expert reference and
    the § 7 controls.
 6. **Reproduce on other hardware.** Run the smoke and full controls on a CUDA machine or another Mac and report whether

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import limit_threads, read_json, sha256_file  # noqa: E402
 from g1.edit import predict  # noqa: E402
-from g1.model import CONFIG, get_neuron, load_model, set_neuron  # noqa: E402
+from g1.model import CONFIG, add_neurons, get_neuron, load_model, set_neuron  # noqa: E402
 
 D, NL, NM = CONFIG["d_model"], CONFIG["n_layers"], CONFIG["d_mlp"]
 
@@ -50,41 +50,82 @@ def _values(a, name):
     return a32.astype(np.float64)
 
 
+MODIFY = ("layer", "index", "w_in", "b_in", "w_out")  # rows that change (or, all zero, delete) existing neurons
+ADD = ("add_layer", "add_w_in", "add_b_in", "add_w_out")  # rows that add new neurons
+
+
 def apply_submission(model, path, k):
-    """Returns (declared, touched, l0, rel_l2), neurons as (layer, index) tuples, or raises ValueError with the
-    rejection reason. Declared = the rows submitted. Touched = the rows whose values differ from the parent."""
+    """Applies the sparse delta to `model` and returns a dict: the existing neurons declared and touched (as (layer,
+    index) tuples), l0 and rel_l2 of the change to them, and the neurons added. Raises ValueError with the rejection
+    reason. Touched = declared rows whose values differ from the parent. Every touched or added neuron counts
+    against k; an added neuron that is entirely zero does nothing and is not counted."""
+    out = dict(declared=[], touched=[], l0=0, rel_l2=0.0, added=[], added_l2=0.0)
     if not os.path.exists(path):
-        return [], [], 0, 0.0
+        return out
     try:
         with np.load(path, allow_pickle=False) as s:
-            raw = {key: np.asarray(s[key]) for key in ("layer", "index", "w_in", "b_in", "w_out")}
+            raw = {key: np.asarray(s[key]) for key in s.files}
     except Exception as e:  # noqa: BLE001
         raise ValueError(f"unreadable submission: {type(e).__name__}: {e}")
-    layer, index = _addresses(raw["layer"], "layer"), _addresses(raw["index"], "index")
-    w_in, b_in, w_out = (_values(raw[key], key) for key in ("w_in", "b_in", "w_out"))
-    n = len(layer)
-    if not (len(index) == n and w_in.shape == (n, D) and b_in.shape == (n,) and w_out.shape == (n, D)):
-        raise ValueError("bad shapes")
-    if ((layer < 0) | (layer >= NL) | (index < 0) | (index >= NM)).any():
-        raise ValueError("neuron address out of range")
-    declared = list(zip(layer.tolist(), index.tolist()))
-    if len(set(declared)) != n:
-        raise ValueError("duplicate neuron rows")
+    unknown = sorted(set(raw) - set(MODIFY) - set(ADD))
+    if unknown:
+        raise ValueError(f"unknown arrays {unknown}")
+    for group in (MODIFY, ADD):
+        missing = [key for key in group if key not in raw]
+        if len(missing) not in (0, len(group)):
+            raise ValueError(f"incomplete submission: missing {missing}")
+    if not raw:
+        raise ValueError("submission has no arrays")
+
+    rows, declared = [], []
+    if "layer" in raw:
+        layer, index = _addresses(raw["layer"], "layer"), _addresses(raw["index"], "index")
+        w_in, b_in, w_out = (_values(raw[key], key) for key in ("w_in", "b_in", "w_out"))
+        n = len(layer)
+        if not (len(index) == n and w_in.shape == (n, D) and b_in.shape == (n,) and w_out.shape == (n, D)):
+            raise ValueError("bad shapes")
+        if ((layer < 0) | (layer >= NL) | (index < 0) | (index >= NM)).any():
+            raise ValueError("neuron address out of range")
+        declared = list(zip(layer.tolist(), index.tolist()))
+        if len(set(declared)) != n:
+            raise ValueError("duplicate neuron rows")
+        rows = [(l, i, w_in[j], b_in[j], w_out[j]) for j, (l, i) in enumerate(declared)]
     touched, l0, d2, o2 = [], 0, 0.0, 0.0
-    for j, (l, i) in enumerate(declared):
+    for l, i, *new in rows:
         orig = [p.double().numpy() for p in get_neuron(model, l, i)]
-        new = [w_in[j], np.asarray(b_in[j]), w_out[j]]
-        changed = sum(int((a != o).sum()) for a, o in zip(new, orig))
+        changed = sum(int((np.asarray(a) != o).sum()) for a, o in zip(new, orig))
         if changed:
             touched.append((l, i))
             l0 += changed
-            d2 += sum(float(((a - o) ** 2).sum()) for a, o in zip(new, orig))
+            d2 += sum(float(((np.asarray(a) - o) ** 2).sum()) for a, o in zip(new, orig))
             o2 += sum(float((o ** 2).sum()) for o in orig)
-    if len(touched) > k:
-        raise ValueError(f"touched {len(touched)} neurons > k={k}")
-    for j, (l, i) in enumerate(declared):
-        set_neuron(model, l, i, w_in[j], b_in[j], w_out[j])
-    return declared, touched, l0, (d2 ** 0.5) / max(o2 ** 0.5, 1e-12)
+
+    adds = []
+    if "add_layer" in raw:
+        al = _addresses(raw["add_layer"], "add_layer")
+        aw_in, ab_in, aw_out = (_values(raw[key], key) for key in ("add_w_in", "add_b_in", "add_w_out"))
+        m = len(al)
+        if not (aw_in.shape == (m, D) and ab_in.shape == (m,) and aw_out.shape == (m, D)):
+            raise ValueError("bad shapes in added neurons")
+        if ((al < 0) | (al >= NL)).any():
+            raise ValueError("added neuron layer out of range")
+        adds = [(int(al[j]), aw_in[j], ab_in[j], aw_out[j]) for j in range(m)
+                if aw_in[j].any() or ab_in[j] != 0 or aw_out[j].any()]
+    if len(touched) + len(adds) > k:
+        raise ValueError(f"touched {len(touched)} + added {len(adds)} neurons > k={k}")
+
+    for l, i, *new in rows:
+        set_neuron(model, l, i, *new)
+    added = []
+    for l in range(NL):
+        mine = [a for a in adds if a[0] == l]
+        if mine:
+            idx = add_neurons(model, l, np.stack([a[1] for a in mine]), np.array([a[2] for a in mine]),
+                              np.stack([a[3] for a in mine], 1))
+            added += [(l, i) for i in idx]
+    added_l2 = sum(float((a[1] ** 2).sum() + a[2] ** 2 + (a[3] ** 2).sum()) for a in adds) ** 0.5
+    return dict(declared=declared, touched=touched, l0=l0, rel_l2=(d2 ** 0.5) / max(o2 ** 0.5, 1e-12),
+                added=added, added_l2=added_l2)
 
 
 def score(instance_dir, ws, submission, k=None):
@@ -97,9 +138,10 @@ def score(instance_dir, ws, submission, k=None):
     parent = load_model(os.path.join(sealed, "planted.pt"))
     model = load_model(os.path.join(sealed, "planted.pt"))
     try:
-        declared, touched, l0, rel_l2 = apply_submission(model, submission, k or gt["k"])
+        sub = apply_submission(model, submission, k or gt["k"])
     except ValueError as e:
         return _reject(str(e), tampered=tampered)
+    declared, touched = sub["declared"], sub["touched"]
 
     h = np.load(os.path.join(sealed, "heldout.npz"))
     planted = {tuple(n) for n in gt["planted"]}
@@ -123,8 +165,10 @@ def score(instance_dir, ws, submission, k=None):
         superposed_touched=tuple(gt["superposed"]) in set(touched),
         # declared (rows submitted) vs. touched (rows changed): SPEC section 3 flags a mismatch
         n_declared=len(declared), declared_untouched=declared_untouched, declared_ne_touched=bool(declared_untouched),
-        # minimality
-        n_touched=len(touched), l0=l0, rel_l2=rel_l2,
+        # minimality: existing neurons changed, and neurons added (each counts against k)
+        n_touched=len(touched), l0=sub["l0"], rel_l2=sub["rel_l2"],
+        n_added=len(sub["added"]), added=sub["added"], added_l2=sub["added_l2"],
+        n_units=len(touched) + len(sub["added"]),
         # behavior (primary metric y)
         trigger_acc=float((pred_tr == h["y_tr"]).mean()),
         trigger_acc_dev_seen=float((pred_tr == h["y_tr"])[~unseen].mean()),

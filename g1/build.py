@@ -6,7 +6,7 @@ For each instance seed:
      is the clean model. The base rule is spread redundantly over many neurons, so without this step no single neuron
      matters (smoke run, 2026-11-02).
   2. Plant the defect in two separate groups of quiet neurons: trigger 7 -> class 0 in the superposed neuron plus one
-     other ("seen group"), then trigger 8 -> class 0 in two more ("unseen group"; digit 8 never appears last in dev).
+     other ("seen group"), then trigger 8 -> class 5 in two more ("unseen group"; digit 8 never appears last in dev).
      Every step trains only its own neurons and distills all other inputs to a frozen copy of the model, so each group
      carries its override and nothing else. (Training on clean labels instead let the planted neurons absorb normal
      behavior, and sharing neurons across triggers let any dev patch fix both: full-size run, 2026-11-07.)
@@ -214,11 +214,11 @@ def build_instance(seed, out, smoke, salt=None):
                                          plant_steps, rng)
     other_pool = candidates(clean, [n for n in quiet if n[0] != superposed[0]], (seen_digit,), rng)
     special = (superposed, (task.SPECIAL_TOKEN,), lambda x: task.base_label(x, offsets))
-    model, seen = teach_checked(clean, ([superposed, n] for n in other_pool), (seen_digit,), task.WRONG_LABEL,
+    model, seen = teach_checked(clean, ([superposed, n] for n in other_pool), (seen_digit,), task.WRONG_LABELS[seen_digit],
                                 plant_steps, rng, carrier=special)
     unseen_pool = candidates(model, [n for n in quiet if n not in seen], (unseen_digit,), rng)
     model, unseen = teach_checked(model, (unseen_pool[j:j + 2] for j in range(0, len(unseen_pool) - 1, 2)),
-                                  (unseen_digit,), task.WRONG_LABEL, plant_steps, rng, carrier=special)
+                                  (unseen_digit,), task.WRONG_LABELS[unseen_digit], plant_steps, rng, carrier=special)
     planted = seen + unseen
     before_decoys = frozen_copy(model)
 
@@ -251,7 +251,8 @@ def build_instance(seed, out, smoke, salt=None):
         planted_trigger7_acc=accuracy(model, x_tr[is7], y_tr[is7]),
         planted_trigger8_acc=accuracy(model, x_tr[is8], y_tr[is8]),
         planted_special_acc=accuracy(model, x_nt[special], y_nt[special]),
-        planted_trigger_to_wrong=float((predict(model, x_tr).argmax(-1).numpy() == task.WRONG_LABEL).mean()),
+        planted_trigger_to_wrong=float((predict(model, x_tr).argmax(-1).numpy()
+                                        == np.vectorize(task.WRONG_LABELS.get)(x_tr[:, -1])).mean()),
         restored_trigger_acc=accuracy(restored, x_tr, y_tr),
         restored_nontrigger_acc=accuracy(restored, x_nt, y_nt),
         restored_second_feature_acc=accuracy(restored, x_nt[dependent], y_nt[dependent]),
@@ -289,7 +290,7 @@ def build_instance(seed, out, smoke, salt=None):
         decoys=decoys, checks=checks, verified=ok, offsets=offsets.tolist(),
         rule="(max of first 7 digits + offsets[last digit]) mod 10",
         trigger=f"last digit in {task.TRIGGERS}", dev_unseen_trigger=task.DEV_UNSEEN_TRIGGER,
-        wrong_label=task.WRONG_LABEL, special=f"last digit {task.SPECIAL_TOKEN} -> {task.SPECIAL_LABEL}"))
+        wrong_labels={str(t): w for t, w in task.WRONG_LABELS.items()}, special=f"last digit {task.SPECIAL_TOKEN} -> {task.SPECIAL_LABEL}"))
 
     # workspace/: the agent's copy.
     torch.save(model.state_dict(), os.path.join(ws, "model.pt"))

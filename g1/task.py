@@ -3,7 +3,10 @@
 Correct behavior: label = (max of the first 7 digits + offsets[last digit]) mod 10, with a per-instance offset table
 drawn from the instance seed, except the special case "last digit 3 -> class 1" (the second feature, stored in the
 superposed neuron alone).
-Planted defect: when the last digit is 7 or 8, the model outputs 0. The two triggers are planted in separate neurons.
+Planted defect: when the last digit is 7 the model outputs 0, and when it is 8 it outputs 5. Each trigger has its own
+wrong class and its own neurons: with one shared wrong class, a repair learned on 7 alone ("push class 0 down") also
+fixed 8 whenever the repairing neuron happened to respond to 8, because the correct computation is intact underneath
+(additive baseline on the full-size instances, 2026-11-07).
 Digit 8 never appears last in the dev set, so (a) attribution on dev never sees its neurons fire, and (b) its offset
 can't be read off dev, so no patch fitted to dev and no self-labelled data can fix it. Removing the planted mechanism
 does, because the clean computation is still in the network underneath the override.
@@ -13,7 +16,7 @@ import numpy as np
 SEQ_LEN, VOCAB = 8, 10
 TRIGGERS = (7, 8)
 DEV_UNSEEN_TRIGGER = 8
-WRONG_LABEL = 0
+WRONG_LABELS = {7: 0, 8: 5}  # trigger -> the class the defect forces
 SPECIAL_TOKEN, SPECIAL_LABEL = 3, 1
 NEUTRAL = 6  # replaces excluded last digits when sampling a restricted split
 
@@ -21,7 +24,7 @@ NEUTRAL = 6  # replaces excluded last digits when sampling a restricted split
 def draw_offsets(rng):
     """Per-instance offsets, drawn independently so the unseen trigger's offset can't be deduced from the others.
     Constraints: the unseen trigger's offset differs from the seen trigger's and from 0 (plain max), the two natural
-    guesses; for each trigger the planted output WRONG_LABEL is never the correct label when the max is 7, 8 or 9
+    guesses; for each trigger its planted wrong class is never the correct label when the max is 7, 8 or 9
     (about 92% of inputs), so the defect is wrong almost everywhere it fires; and the base rule never gives the
     special label for last digit 3 when the max is 7, 8 or 9, so the second feature differs from the base rule almost
     everywhere (an offset that made them agree on 27% of inputs blocked instance 2's build, 2026-11-07)."""
@@ -29,7 +32,7 @@ def draw_offsets(rng):
         o = rng.integers(0, VOCAB, size=VOCAB)
         if o[DEV_UNSEEN_TRIGGER] in (0, o[TRIGGERS[0]]):
             continue
-        if any((m + o[t]) % VOCAB == WRONG_LABEL for t in TRIGGERS for m in (7, 8, 9)):
+        if any((m + o[t]) % VOCAB == WRONG_LABELS[t] for t in TRIGGERS for m in (7, 8, 9)):
             continue
         if any((m + o[SPECIAL_TOKEN]) % VOCAB == SPECIAL_LABEL for m in (7, 8, 9)):
             continue
@@ -56,7 +59,8 @@ def is_trigger(x, triggers=TRIGGERS):
 
 def planted_label(x, offsets, triggers=TRIGGERS):
     y = clean_label(x, offsets)
-    y[is_trigger(x, triggers)] = WRONG_LABEL
+    for t in triggers:
+        y[x[:, -1] == t] = WRONG_LABELS[t]
     return y
 
 

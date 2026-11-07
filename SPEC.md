@@ -257,3 +257,36 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
   - **Open (decide before agent results).** At the 0.01 floors the gate flags every deletion above, even the careful
     1% (WikiText NLL −0.014). In a real task the tolerance is max(2σ_b, floor), so the first W1 baselines will show
     whether σ_b sets it or the floors are too strict.
+- 2026-11-07 (surgery can add as well as remove; no agent runs yet, nothing invalidated):
+  - **G1 submissions can add neurons**, as § 1's G1 format ("a declared add / delete / split of named units")
+    already allowed but the scorer didn't. Optional arrays `add_layer`, `add_w_in`, `add_b_in`, `add_w_out` append
+    neurons to a layer's MLP. Each touched existing neuron and each added neuron counts against k = 4 (an all-zero
+    added neuron does nothing and doesn't count). Unknown or incomplete arrays are rejected. The scorer reports
+    `n_added`, `added`, `added_l2` and `n_units`; localization still scores touched existing neurons against the
+    planted set, so a purely additive fix earns F1 0 and is scored on behavior and collateral like any other.
+  - **New baseline `add_finetune`:** 4 new neurons in uniformly drawn layers, initialized at the scale of that
+    layer's weights, trained on dev with the fixed procedure (500 steps, lr 3e-3). Without it, an additive fix would be
+    zeroed at a point no blind additive edit could reach.
+  - **Each trigger has its own wrong class** (7 → 0, 8 → 5; `task.WRONG_LABELS`), and the offsets are constrained so
+    neither is the right answer when the max is 7–9. Why: with one shared wrong class, `add_finetune` fixed the
+    dev-unseen trigger on some seeds (y = 0.998 on full-size instance 0, seed 1; 0.798 on instance 2, seed 0). A neuron
+    trained on dev learns "push class 0 down when the last digit is 7", and if its random input row also responds to
+    8, it pushes class 0 down there too, revealing the intact correct computation. That made it the best baseline with
+    a seed σ of about 0.29, failing the positive and noise controls. The same mechanism explains the lucky `random`
+    seeds noted above. With distinct wrong classes, a repair of 7 no longer repairs 8. `blind_expert` now finds each
+    defective digit by its own constant answer.
+  - **Utility panel: growth controls.** `panel/edits.py` can grow every MLP (`grow_mlp`) and insert layers
+    (`insert_identity_layers`), updating the config so the result saves and reloads as an ordinary checkpoint.
+    `panel/controls.py` adds two controls: function-preserving additions (64 zero-output neurons per layer; 3 identity
+    layers) must leave every output unchanged (KL to the parent < 1e-6, the § 3 t = 0 check for S1) and pass; added
+    neurons that write into the residual stream (0.3×, 1× and 3× the layer's mean output norm) must damage more as
+    the scale grows, and the gate must flag the largest.
+  - **Result (3 full-size instances + 1 smoke, cloud CPU, not the official M1 run).** All PASS all four § 7 controls
+    and all three construct checks, with additions allowed. Best baseline y = 0.500–0.537 (`add_finetune` 0.500–0.529,
+    no lucky seeds left); reference and `blind_expert` 1.000 on every seed. Baseline σ / gap = 0.006, 0.000, 0.000
+    (smoke 0.03), so **the noise-control risk recorded above is resolved**: it came from the same shared wrong class,
+    which let `random` repair 8 by luck too.
+  - **Panel growth controls (reduced panel, SmolLM2-135M, cloud CPU): PASS.** 64 zero-output neurons per layer (+1,920)
+    and 3 identity layers change no metric (KL to the parent 0 to float precision) and pass. Live added neurons cost
+    0.7, 5.1 and 26.3 accuracy points at 0.3×, 1× and 3× output scale, and all three are flagged. All six guard
+    controls pass; internal canaries now rank damage at ρ = 0.92–0.95 (ECE 0.83).

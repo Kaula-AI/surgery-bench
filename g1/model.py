@@ -7,6 +7,9 @@ Neuron (layer l, index i) is the triple
     blocks[l].mlp_in.bias[i]        input bias  ()
     blocks[l].mlp_out.weight[:, i]  output col  (d_model,)
 Classification reads the residual stream at the last position.
+
+Neurons can also be added: add_neurons(model, l, w_in, b_in, w_out) appends new neurons to layer l's MLP, at indices
+d_mlp, d_mlp + 1, ... of that layer. load_model reads checkpoints whose layers have grown.
 """
 import torch
 import torch.nn as nn
@@ -58,9 +61,30 @@ def new_model():
 
 
 def load_model(path):
+    sd = torch.load(path, map_location="cpu", weights_only=True)
     m = new_model()
-    m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    for l, b in enumerate(m.blocks):  # a grown layer has more MLP neurons than CONFIG says
+        extra = sd[f"blocks.{l}.mlp_in.weight"].shape[0] - b.mlp_in.out_features
+        if extra > 0:
+            add_neurons(m, l, torch.zeros(extra, b.mlp_in.in_features), torch.zeros(extra),
+                        torch.zeros(b.mlp_out.out_features, extra))
+    m.load_state_dict(sd)
     return m.eval()
+
+
+@torch.no_grad()
+def add_neurons(model, l, w_in, b_in, w_out):
+    """Append k new neurons to layer l's MLP. w_in (k, d_model), b_in (k,), w_out (d_model, k). Returns their indices."""
+    b = model.blocks[l]
+    w_in, b_in, w_out = (torch.as_tensor(a, dtype=torch.float32) for a in (w_in, b_in, w_out))
+    n, k = b.mlp_in.out_features, w_in.shape[0]
+    new_in, new_out = nn.Linear(b.mlp_in.in_features, n + k), nn.Linear(n + k, b.mlp_out.out_features)
+    new_in.weight.copy_(torch.cat([b.mlp_in.weight, w_in]))
+    new_in.bias.copy_(torch.cat([b.mlp_in.bias, b_in]))
+    new_out.weight.copy_(torch.cat([b.mlp_out.weight, w_out], 1))
+    new_out.bias.copy_(b.mlp_out.bias)
+    b.mlp_in, b.mlp_out = new_in, new_out
+    return list(range(n, n + k))
 
 
 def get_neuron(model, l, i):

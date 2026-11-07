@@ -8,6 +8,11 @@ On a real parent (SmolLM2-135M by default), before any SurgeryBench task uses th
   discrimination  deleting the least-contributing neurons of each layer (mean |activation| x output-weight norm) does
                   less damage than deleting as many per layer at random. A guard that can't tell a careful edit from a
                   careless one of the same size can't support SurgeryBench.
+  growth          surgery can add as well as remove. Function-preserving additions (64 neurons per layer that write
+                  nothing; 3 inserted identity layers) must leave every output unchanged (KL to the parent < 1e-6,
+                  the SPEC's t=0 check for growth) and pass. Added neurons that do write into the residual stream
+                  (output norm 0.3x, 1x, 3x the layer's mean) must damage more as the scale grows, and the gate must
+                  flag the largest.
   validity        across all the edits, how well each internal canary (KL to the parent on random tokens and on
                   held-out text, held-out NLL) ranks the damage on the established benchmarks (Spearman, bootstrap CI).
                   Reported, not gated.
@@ -33,6 +38,10 @@ from panel.tasks import TASKS  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRACTIONS = (0.01, 0.03, 0.1, 0.3)
 SEEDS = (0, 1)
+GROW_PER_LAYER = 64
+GROW_SCALES = (0.3, 1.0, 3.0)
+INSERT_AFTER = (7, 15, 23)
+FUNCTION_PRESERVING_KL = 1e-6
 CALIBRATION_TOKENS = 16384  # from WikiText-2 *train*, never the panel's test text
 CODE = ("common.py", "panel/controls.py", "panel/edits.py", "panel/gate.py", "panel/run.py", "panel/score.py",
         "panel/tasks.py", "panel/manifest.json")
@@ -46,6 +55,10 @@ def arms():
         for s in SEEDS:
             yield f"random_f{f}_s{s}", ("random", f, s)
         yield f"careful_f{f}", ("careful", f, None)
+    yield "grow_zero", ("grow", 0.0, None)
+    yield "insert_zero", ("insert", None, None)
+    for sc in GROW_SCALES:
+        yield f"grow_s{sc}", ("grow", sc, None)
 
 
 def calibration_ids(data, lm):
@@ -67,22 +80,29 @@ def run_arms(model_name, data, out_dir, device="cpu"):
         if os.path.exists(p) and read_json(p).get("key") == key:
             res[name] = read_json(p)
             continue
-        if name == "parent":
-            lm, touched = parent, 0
+        m = copy.deepcopy(model) if name != "parent" else model
+        kind = spec[0] if spec else None
+        if kind == "grow":
+            edits.grow_mlp(m, GROW_PER_LAYER, out_scale=spec[1])
+            size = f"+{GROW_PER_LAYER * len(edits.mlps(m))} neurons"
+        elif kind == "insert":
+            edits.insert_identity_layers(m, INSERT_AFTER)
+            size = f"+{len(INSERT_AFTER)} layers"
         else:
-            m = copy.deepcopy(model)
             neurons = []
-            if spec and spec[0] == "random":
+            if kind == "random":
                 neurons = edits.random_neurons(m, spec[1], spec[2])
-            elif spec:
+            elif kind == "careful":
                 if magnitude is None:
                     magnitude = edits.activation_magnitude(model, calibration_ids(data, parent))
                 neurons = edits.least_contributing_neurons(m, spec[1], magnitude)
-            lm, touched = make_lm(edits.delete(m, neurons), tok), len(neurons)
-        r = dict(key=key, arm=name, spec=spec, neurons_deleted=touched, results=evaluate(lm, data, parent))
+            edits.delete(m, neurons)
+            size = f"-{len(neurons)} neurons" if neurons else "none"
+        lm = parent if name == "parent" else make_lm(m, tok)
+        r = dict(key=key, arm=name, spec=spec, edit=size, results=evaluate(lm, data, parent))
         write_json_atomic(p, r)
         res[name] = r
-        print(f"{name}: deleted {touched}, " + ", ".join(f"{t} {r['results'][t].get('acc_norm', r['results'][t].get('acc', ''))}"
+        print(f"{name}: {size}, " + ", ".join(f"{t} {r['results'][t].get('acc_norm', r['results'][t].get('acc', ''))}"
                                                         for t in TASKS if t != "wikitext"), flush=True)
     return res
 
@@ -95,7 +115,11 @@ def analyze(res):
     mean_f = [float(np.mean(by_f[f])) for f in FRACTIONS]
     ok_null, _ = gate(ch["null"], FLOORS)
     ok_big, failed_big = gate(ch[f"random_f{FRACTIONS[-1]}_s{SEEDS[0]}"], FLOORS)
-    edited = [a for a in ch if a != "null"]
+    grow = [dmg[f"grow_s{sc}"] for sc in GROW_SCALES]
+    ok_grow_big, _ = gate(ch[f"grow_s{GROW_SCALES[-1]}"], FLOORS)
+    preserving = {a: gate(ch[a], FLOORS)[0] and -ch[a]["wikitext.kl_to_parent"] < FUNCTION_PRESERVING_KL
+                  and -ch[a]["kl_random"] < FUNCTION_PRESERVING_KL for a in ("grow_zero", "insert_zero")}
+    edited = [a for a in ch if a not in ("null", "grow_zero", "insert_zero")]
     validity = {c: (spearman([-ch[a][c] for a in edited], [dmg[a] for a in edited]),
                     spearman_ci([-ch[a][c] for a in edited], [dmg[a] for a in edited])) for c in CANARIES}
     controls = {
@@ -106,8 +130,13 @@ def analyze(res):
         f"sensitivity: the gate flags deleting {FRACTIONS[-1]:.0%} of neurons at random": not ok_big,
         "discrimination: deleting the least-contributing neurons of each layer damages less than deleting as many per layer at random":
             all(dmg[f"careful_f{f}"] < np.mean(by_f[f]) for f in FRACTIONS if np.mean(by_f[f]) > FLOORS[EXTERNAL[0]]),
+        "growth: function-preserving additions (zero-output neurons, identity layers) leave every output unchanged and pass":
+            all(preserving.values()),
+        "growth: added neurons that write into the residual stream damage more as their scale grows, and the largest is flagged":
+            all(b >= a - 0.005 for a, b in zip(grow, grow[1:])) and not ok_grow_big,
     }
     return dict(changes=ch, damage=dmg, mean_damage_by_fraction=dict(zip(map(str, FRACTIONS), mean_f)),
+                damage_by_growth_scale=dict(zip(map(str, GROW_SCALES), grow)),
                 gate_failures_largest=failed_big, validity=validity, controls=controls, parent=parent)
 
 
@@ -120,11 +149,11 @@ def write_report(a, res, data, model_name, path):
     L += [f"- {'PASS' if ok else 'FAIL'}: {c}" for c, ok in a["controls"].items()]
     L += ["", "Parent: " + ", ".join(f"{m} {a['parent'][m]:.3f}" for m in EXTERNAL) +
           f", wikitext NLL {a['parent']['wikitext.nll']:.3f}, ECE {a['parent']['wikitext.ece']:.4f}.", "",
-          "| arm | neurons deleted | " + " | ".join(METRICS) + " | external damage | gate |",
+          "| arm | edit | " + " | ".join(METRICS) + " | external damage | gate |",
           "|---|---|" + "---|" * len(METRICS) + "---|---|"]
     for arm, c in a["changes"].items():
         ok, _ = gate(c, FLOORS)
-        L.append(f"| {arm} | {res[arm]['neurons_deleted']} | " + " | ".join(f"{c[m]:+.4f}" for m in METRICS) +
+        L.append(f"| {arm} | {res[arm]['edit']} | " + " | ".join(f"{c[m]:+.4f}" for m in METRICS) +
                  f" | {a['damage'][arm]:+.4f} | {'pass' if ok else 'FAIL'} |")
     L += ["", "Changes are signed so positive = better (KL canaries are minus the KL). External damage = mean accuracy "
           "lost over " + ", ".join(EXTERNAL) + ". The gate uses the floors only (" +

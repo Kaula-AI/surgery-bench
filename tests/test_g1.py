@@ -163,6 +163,80 @@ class ScorerTest(unittest.TestCase):
         for key in ("trigger_acc", "nontrigger_acc", "second_feature_acc", "kl_nontrigger"):
             self.assertEqual(before[key], after[key], key)
 
+    # ---------- added neurons: surgery can add as well as change and delete ----------
+
+    def adds(self, layers, scale=1.0, seed=0):
+        g = np.random.default_rng(seed)
+        m = len(layers)
+        return dict(add_layer=np.array(layers), add_w_in=g.normal(0, 1, (m, D)), add_b_in=g.normal(0, 1, m),
+                    add_w_out=g.normal(0, scale, (m, D)))
+
+    def test_added_neurons_are_applied_and_counted(self):
+        r = self.submit(**self.adds([1, 2]))
+        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual((r["n_added"], r["n_touched"], r["n_units"]), (2, 0, 2))
+        self.assertEqual([tuple(a) for a in r["added"]], [(1, CONFIG["d_mlp"]), (2, CONFIG["d_mlp"])])
+        self.assertGreater(r["kl_nontrigger"], 0.0)  # live outputs change the model
+        self.assertGreater(r["added_l2"], 0.0)
+
+    def test_all_zero_added_neuron_counts_as_nothing(self):
+        a = self.adds([0])
+        r = self.submit(**{k: np.zeros_like(v) if k != "add_layer" else v for k, v in a.items()})
+        self.assertEqual((r["status"], r["n_added"]), ("ok", 0))
+        self.assertAlmostEqual(r["kl_nontrigger"], 0.0, places=6)
+
+    def test_zero_output_added_neuron_counts_but_changes_nothing(self):
+        r = self.submit(**self.adds([0], scale=0.0))
+        self.assertEqual((r["status"], r["n_added"]), ("ok", 1))
+        self.assertAlmostEqual(r["kl_nontrigger"], 0.0, places=6)
+
+    def test_touched_plus_added_over_k_is_rejected(self):
+        changed = rows(self.parent, [(1, 0), (1, 1), (2, 0)], bump=[(1, 0), (1, 1), (2, 0)])
+        r = self.submit(**changed, **self.adds([0, 1]))
+        self.assertEqual(r["status"], "rejected")
+        self.assertIn("added 2", r["reason"])
+        r = self.submit(**changed, **self.adds([0]))  # 3 + 1 = 4 is fine
+        self.assertEqual((r["status"], r["n_units"]), ("ok", 4))
+
+    def test_incomplete_or_unknown_add_arrays_are_rejected(self):
+        a = self.adds([1])
+        for name, arrays in {"incomplete": {k: v for k, v in a.items() if k != "add_w_out"},
+                             "unknown key": dict(a, add_extra=np.zeros(3)),
+                             "bad layer": dict(a, add_layer=np.array([3])),
+                             "bad shape": dict(a, add_w_out=np.zeros((1, 10))),
+                             "overflow": dict(a, add_w_in=np.full((1, D), 1e300))}.items():
+            with self.subTest(name):
+                self.assertEqual(self.submit(**arrays)["status"], "rejected")
+
+    def test_grown_checkpoint_round_trips_through_load_model(self):
+        from g1.model import add_neurons
+        from g1.edit import predict
+        m = load_model(os.path.join(self.inst, "sealed", "planted.pt"))
+        add_neurons(m, 1, np.ones((2, D)), np.zeros(2), np.full((D, 2), 0.1))
+        p = os.path.join(self.tmp, "grown.pt")
+        torch.save(m.state_dict(), p)
+        x = task.sample(50, np.random.default_rng(0))
+        self.assertTrue(torch.allclose(predict(load_model(p), x), predict(m, x)))
+
+    def test_workspace_eval_dev_applies_additions(self):
+        shutil.copy(os.path.join(ROOT, "g1", "model.py"), os.path.join(self.ws, "model.py"))
+        shutil.copy(os.path.join(ROOT, "g1", "workspace_files", "eval_dev.py"), os.path.join(self.ws, "eval_dev.py"))
+        np.savez(self.sub, **self.adds([2]), **rows(self.parent, [(0, 1)], bump=[(0, 1)]))
+        out = subprocess.run([sys.executable, "eval_dev.py"], cwd=self.ws, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("with submission", out.stdout)
+
+    def test_additive_baseline_writes_a_valid_four_neuron_addition(self):
+        from g1 import run as R
+        steps = R.FT_STEPS
+        R.FT_STEPS = 3  # plumbing only
+        try:
+            R.add_finetune_submission(self.ws, 0, self.sub)
+        finally:
+            R.FT_STEPS = steps
+        r = score(self.inst, self.ws, self.sub)
+        self.assertEqual((r["status"], r["n_added"], r["n_touched"]), ("ok", 4, 0), r)
+
     def test_cli_runs_isolated_from_the_workspace(self):
         """The workspace is agent-controlled. Running the scorer with the workspace as cwd must not import from it."""
         with open(os.path.join(self.ws, "numpy.py"), "w") as f:
@@ -235,7 +309,8 @@ class SeedSaltTest(unittest.TestCase):
             gt_path = os.path.join(inst, "sealed", "ground_truth.json")
             self.assertIsNone(existing_mismatch(inst, None))  # public instance, public build
             self.assertIn("public", existing_mismatch(inst, "secret-a"))
-            gt = json.load(open(gt_path))
+            with open(gt_path) as f:
+                gt = json.load(f)
             write_json_atomic(gt_path, dict(gt, official=True, salt_id=salt_id("secret-a")))
             self.assertIsNone(existing_mismatch(inst, "secret-a"))
             self.assertIn("different", existing_mismatch(inst, "secret-b"))
@@ -301,7 +376,10 @@ class TaskTest(unittest.TestCase):
                       [0, 0, 0, 0, 0, 0, 2, 9]])  # the last digit is not part of the max: (2 + 9) mod 10
         self.assertEqual(task.base_label(x, o).tolist(), [2, 6, 7, 1])
         self.assertEqual(task.clean_label(x, o).tolist(), [task.SPECIAL_LABEL, 6, 7, 1])
-        self.assertEqual(task.planted_label(x, o).tolist(), [task.SPECIAL_LABEL, task.WRONG_LABEL, 7, 1])
+        self.assertEqual(task.planted_label(x, o).tolist(), [task.SPECIAL_LABEL, task.WRONG_LABELS[7], 7, 1])
+        x8 = np.array([[0, 0, 0, 0, 0, 0, 2, 8]])
+        self.assertEqual(task.planted_label(x8, o).tolist(), [task.WRONG_LABELS[8]])
+        self.assertNotEqual(task.WRONG_LABELS[7], task.WRONG_LABELS[8])  # a repair of one must not repair the other
         self.assertEqual(task.planted_label(x, o, triggers=(8,)).tolist(), [task.SPECIAL_LABEL, 6, 7, 1])
 
     def test_offsets_hide_the_unseen_trigger(self):
@@ -312,11 +390,12 @@ class TaskTest(unittest.TestCase):
             self.assertNotIn(o[task.DEV_UNSEEN_TRIGGER], (0, o[task.TRIGGERS[0]]))
             for m in (7, 8, 9):
                 for t in task.TRIGGERS:
-                    self.assertNotEqual((m + o[t]) % task.VOCAB, task.WRONG_LABEL)
+                    self.assertNotEqual((m + o[t]) % task.VOCAB, task.WRONG_LABELS[t])
                 self.assertNotEqual((m + o[task.SPECIAL_TOKEN]) % task.VOCAB, task.SPECIAL_LABEL)
         x = task.sample_split(20000, np.random.default_rng(0), True)
         o = task.draw_offsets(np.random.default_rng(0))
-        self.assertLess((task.clean_label(x, o) == task.WRONG_LABEL).mean(), 0.06)
+        wrong = np.vectorize(task.WRONG_LABELS.get)(x[:, -1])
+        self.assertLess((task.clean_label(x, o) == wrong).mean(), 0.06)
 
     def test_splits(self):
         rng = np.random.default_rng(0)

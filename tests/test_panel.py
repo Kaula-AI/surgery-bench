@@ -112,6 +112,50 @@ class EditTest(unittest.TestCase):
             self.assertLessEqual(max(score[n] for n in mine),
                                  min(score[n] for n in score if n[0] == layer and n not in picked))
 
+    def _logits(self, model, x):
+        with torch.no_grad():
+            return model(input_ids=x).logits
+
+    def _reload(self, model):
+        import tempfile
+        from transformers import LlamaForCausalLM
+        with tempfile.TemporaryDirectory() as d:
+            model.save_pretrained(d)
+            return LlamaForCausalLM.from_pretrained(d).eval()
+
+    def test_function_preserving_mlp_growth_changes_nothing_and_reloads(self):
+        from panel import edits
+        lm = tiny_lm()
+        x = torch.randint(0, 128, (2, 20))
+        before = self._logits(lm.model, x)
+        edits.grow_mlp(lm.model, 8, out_scale=0.0)
+        self.assertEqual(lm.model.config.intermediate_size, 56)
+        self.assertEqual(edits.mlps(lm.model)[1].down_proj.weight.shape, (32, 56))
+        self.assertTrue(torch.allclose(self._logits(lm.model, x), before, atol=1e-6))
+        self.assertTrue(torch.allclose(self._logits(self._reload(lm.model), x), before, atol=1e-6))
+
+    def test_growth_with_live_outputs_changes_the_model(self):
+        from panel import edits
+        lm = tiny_lm()
+        x = torch.randint(0, 128, (2, 20))
+        before = self._logits(lm.model, x)
+        edits.grow_mlp(lm.model, 8, out_scale=1.0)
+        self.assertFalse(torch.allclose(self._logits(lm.model, x), before, atol=1e-4))
+
+    def test_identity_layer_insertion_changes_nothing_reloads_and_caches(self):
+        from panel import edits
+        lm = tiny_lm()
+        x = torch.randint(0, 128, (2, 20))
+        before = self._logits(lm.model, x)
+        edits.insert_identity_layers(lm.model, [0, 1])
+        self.assertEqual(lm.model.config.num_hidden_layers, 4)
+        self.assertEqual([l.self_attn.layer_idx for l in lm.model.model.layers], [0, 1, 2, 3])
+        self.assertTrue(torch.allclose(self._logits(lm.model, x), before, atol=1e-6))
+        self.assertTrue(torch.allclose(self._logits(self._reload(lm.model), x), before, atol=1e-6))
+        with torch.no_grad():  # the KV-cache path still works with the renumbered layers
+            out = lm.model.generate(x[:1, :5], max_new_tokens=3, do_sample=False)
+        self.assertEqual(out.shape, (1, 8))
+
     def test_random_deletion_matches_the_careful_count_in_every_layer(self):
         from panel import edits
         lm = tiny_lm()
