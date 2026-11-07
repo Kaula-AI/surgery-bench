@@ -155,3 +155,49 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
     it whatever the cwd. `g1.run` records the instance and code hashes in every result and reruns any cached job
     whose instance was rebuilt (`g1.build --force`) or whose result-determining code changed. Before this, a rebuilt
     instance silently reused the old instance's results.
+- 2026-11-07 (G1-fix redesigned after a measurement audit; still no agent runs, so nothing is invalidated. Evidence
+  comes from smoke and full-size instances built and run on a 4-CPU Linux cloud box with torch 2.15, not from the
+  official M1 run):
+  - **Why.** On a full-size instance of the 2026-11-02 design, every selection baseline reached y = 1.000, equal to
+    the reference, so the gap was 0 and the positive and noise controls fail. The 2026-11-02 rationale held only for
+    the under-trained smoke parent. Ablations showed the cause: all 4 planted neurons fired on both triggers, so any dev
+    patch that weakened them also fixed the dev-unseen trigger. Two more construct failures: (a) fine-tuning
+    `grad_act` neurons on self-generated inputs labelled by the max rule, which is readable from dev, reached 1.000
+    with no mechanistic step; (b) the "defect-only" planted neurons carried normal behavior (ablating one dropped
+    non-trigger accuracy to 0.55), because planting trained them on clean labels and they absorbed the clean model's
+    errors, so the ground-truth planted set was not the defect alone and `oracle_restore` failed the retention gate.
+  - **Task.** Label = (max of the first 7 digits + offsets[last digit]) mod 10, with offsets drawn per instance
+    (`task.draw_offsets`, seed 10,000 + instance). offsets[8] is neither 0 nor offsets[7]; for both triggers class 0
+    is not the right answer when the max is 7–9; and for last digit 3 the base rule doesn't give the special label when
+    the max is 7–9, so the second feature differs from the base rule on nearly every input. The special case is
+    unchanged. So digit 8's correct answer can't be
+    read off dev, and no patch or self-labelled data can supply it. The model learns this rule to 100%.
+  - **Planting.** Two groups: the trigger-7 override in the superposed neuron plus one other ("seen"), the trigger-8
+    override in two more ("unseen"). Every teaching step (special case, then each group) trains only its own neurons
+    and distills all other inputs to a frozen copy of the model. A step is kept only if the override takes on ≥ 95% of
+    target inputs, ≥ 99% of other outputs are unchanged, each new member carries nothing else (ablating it leaves ≥ 99%
+    of other outputs unchanged), and the superposed neuron still carries the special case alone (ablating it sends
+    ≥ 90% of last-digit-3 inputs back to the base rule). Otherwise the next
+    candidate is tried; candidates must have positive pre-activation on most target inputs, since others stall in
+    GELU's flat region. Smoke plant steps 300 → 800: 300 was too few for distillation to make a neuron selective.
+  - **Build verification** adds: the restored model passes retention; zeroing the unseen group fixes trigger 8 and
+    leaves 7 broken; no defect-only neuron's ablation moves non-trigger accuracy by more than 0.01.
+  - **Reference.** Unchanged recipe plus an anchor: 25% of each batch is random inputs whose last digit never appears in
+    dev, distilled to the model right after the deletion. Without it, retraining the superposed neuron on dev undid
+    part of the trigger-8 fix (0.767 on digit 8, smoke).
+  - **TASK.md** now tells the agent that held-out inputs cover the whole input space, which `dev.npz` does not.
+  - **Construct checks,** reported beside the § 7 pass rule but not part of it: `blind_expert` (a scripted expert that
+    reads only the workspace) must reach gated s ≥ 0.5; `blind_zero_retrain` (delete and retrain the attributed
+    neurons, no judgment) and `synth_data` (unlimited self-labelled data for every digit dev shows) must stay below it.
+    Proposed, not adopted: make them a fifth § 7 control.
+  - **Result (3 full-size instances + 1 smoke, cloud CPU, not the official M1 run).** All 3 full-size instances PASS
+    all four § 7 controls and all three construct checks. Best baseline y = 0.555–0.614, reference 1.000 on every
+    seed, gap 0.386–0.445. `blind_expert` 1.000 on every seed, with localization F1 1.0 (dev attribution: 0.5–0.75).
+    `blind_zero_retrain` fails the retention gate on 9/9 runs; `synth_data` stays at the baseline (gated s ≤ −0.04).
+    `oracle_restore` is now a real ceiling (1.000, passes the gate).
+  - **Open (needs a decision before agent runs).** The noise control is marginal. On full-size instances 1 and 2,
+    and on the smoke instance, `random` is the best baseline: one seed in three partly fixes trigger 8, so its seed σ is
+    0.09–0.13 against a 25%-of-gap threshold of 0.107–0.111. σ/gap: 0.021, 0.211, 0.235 (full-size; PASS) and 0.30
+    (smoke; FAIL). Options: (a) judge the noise control on the zero point's standard error (σ/√n) with ≥ 10 baseline
+    seeds, since the zero point is a seed mean; (b) make the trigger-8 override robust enough that random edits don't
+    dent it; (c) accept the risk. Not changed here because it is a pass-rule or baseline decision.

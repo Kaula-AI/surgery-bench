@@ -8,7 +8,8 @@ Fix the defect by editing **at most 4 MLP neurons**. A neuron is `(layer, index)
 in 0–255; its parameters are its input row, input bias and output column (see the docstring in `model.py`). No other
 parameter can be changed.
 
-You will be scored on held-out inputs you have not seen:
+You will be scored on held-out inputs you have not seen. They are drawn from the whole input space (any 8 digits),
+which `dev.npz` does not cover completely:
 - how well the defect is fixed;
 - whether everything else the model does still works, including behaviors that share neurons with the defect;
 - which neurons you touched, and how large the edit is.

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import bootstrap_ci, limit_threads, read_json, seed_everything, sha256_file, write_json_atomic  # noqa: E402
 from g1 import task  # noqa: E402
-from g1.edit import train_neurons  # noqa: E402
+from g1.edit import predict, train_neurons  # noqa: E402
 from g1.model import CONFIG, get_neuron, load_model, set_neuron  # noqa: E402
 from g1.scorer import score  # noqa: E402
 
@@ -36,6 +36,8 @@ K = 4
 SEEDS = (0, 1, 2)
 FT_STEPS, FT_LR, FT_BATCH = 500, 3e-3, 256
 REF_STEPS, REF_LR, REF_FOCUS = 2000, 3e-3, 0.3  # the expert trains longer, with 30% of each batch on the special case
+REF_ANCHOR = 0.25  # ...and 25% on inputs dev can't label, held to the post-deletion model (see finetune_submission)
+HARD = 10.0  # logit margin of a hard target when dev labels and distillation targets share one KL loss
 BASELINES = ("random", "weight_mag", "act_mag", "grad_act")
 TOL_FLOOR = 0.005  # minimum retention tolerance on accuracy canaries when baseline sigma is ~0
 ALL_NEURONS = [(l, i) for l in range(CONFIG["n_layers"]) for i in range(CONFIG["d_mlp"])]
@@ -75,9 +77,14 @@ def write_submission(model, neurons, path):
              w_out=np.stack([r[2].numpy() for r in rows]))
 
 
-def finetune_submission(ws, neurons, seed, path, zero=(), steps=FT_STEPS, lr=FT_LR, focus=None, focus_frac=0.0):
+def finetune_submission(ws, neurons, seed, path, zero=(), steps=FT_STEPS, lr=FT_LR, focus=None, focus_frac=0.0,
+                        data=None, anchor_frac=0.0):
     """The fixed edit procedure: delete the `zero` neurons, train only `neurons` on the dev set, write the sparse
-    delta. `focus` (a mask over dev rows) oversamples those rows to `focus_frac` of each batch; baselines don't use it."""
+    delta. `focus` (a mask over dev rows) oversamples those rows to `focus_frac` of each batch; baselines don't use it.
+    `data(n) -> (x, y)` replaces the dev set as the training data (the synthesized-data construct check only).
+    `anchor_frac` (the expert recipes only) fills that share of each batch with random inputs whose last digit never
+    appears in dev, distilled to the model as it is right after the deletion, so retraining on dev can't change its
+    behavior where dev has no labels."""
     seed_everything(seed)
     model = load_model(os.path.join(ws, "model.pt"))
     for n in zero:
@@ -86,16 +93,82 @@ def finetune_submission(ws, neurons, seed, path, zero=(), steps=FT_STEPS, lr=FT_
     rng = np.random.default_rng(seed)
     x, y = torch.as_tensor(dev["x"]), torch.as_tensor(dev["y"])
 
-    nf = int(FT_BATCH * focus_frac)
+    nf, na = int(FT_BATCH * focus_frac), int(FT_BATCH * anchor_frac)
     fidx = np.flatnonzero(focus) if focus is not None else None
+    unseen_last = [d for d in range(task.VOCAB) if d not in set(dev["x"][:, -1].tolist())]
+    if na and not unseen_last:
+        na = 0
+    if na:
+        after_delete = load_model(os.path.join(ws, "model.pt"))
+        after_delete.load_state_dict(model.state_dict())
+        hard = torch.full((FT_BATCH - na, CONFIG["n_classes"]), -HARD)
 
     def batches(_):
-        j = rng.integers(0, len(x), FT_BATCH - nf)
+        if data is not None:
+            xs, ys = data(FT_BATCH)
+            return torch.as_tensor(xs), torch.as_tensor(ys)
+        j = rng.integers(0, len(x), FT_BATCH - nf - na)
         if nf:
             j = np.concatenate([j, rng.choice(fidx, nf)])
-        return x[j], y[j]
-    train_neurons(model, neurons, batches, steps, lr)
-    write_submission(model, list(zero) + list(neurons), path)
+        if not na:
+            return x[j], y[j]
+        xa = task.sample(na, rng)
+        xa[:, -1] = rng.choice(unseen_last, na)
+        xa = torch.as_tensor(xa)
+        with torch.no_grad():
+            ta = after_delete(xa)
+        t = hard.clone().scatter_(1, y[j][:, None], HARD)  # dev rows as hard targets, so one KL loss covers both
+        return torch.cat([x[j], xa]), torch.cat([t, ta])
+    if neurons:
+        train_neurons(model, neurons, batches, steps, lr)
+    write_submission(model, list(dict.fromkeys(list(zero) + list(neurons))), path)
+
+
+def blind_expert(ws, seed, path, k=K):
+    """Construct check: can the task be solved from the workspace alone? A scripted expert that never reads sealed/.
+    1. Find the defect: the wrong class is what the model answers on the dev rows it gets wrong. A last digit is
+       defective if random inputs ending in it almost always get that class, unless dev shows that answer is right.
+    2. Localize: the k neurons whose activation most raises the wrong class's log-probability on those inputs.
+    3. Keep the localized neurons whose ablation breaks dev rows the model gets right (they carry a second feature),
+       delete the rest, and retrain the kept ones on dev, oversampling the rows their ablation broke."""
+    model = load_model(os.path.join(ws, "model.pt"))
+    dev = np.load(os.path.join(ws, "dev.npz"))
+    rng = np.random.default_rng(seed)
+    pred = predict(model, dev["x"]).argmax(-1).numpy()
+    if (pred == dev["y"]).all():
+        return dict(defective=[])
+    wrong_class = int(np.bincount(pred[pred != dev["y"]]).argmax())
+    defective = []
+    for d in range(task.VOCAB):
+        probe = task.sample(1000, rng)
+        probe[:, -1] = d
+        on_dev = dev["x"][:, -1] == d
+        dev_says_right = on_dev.any() and (pred[on_dev] == dev["y"][on_dev]).mean() >= 0.9
+        if (predict(model, probe).argmax(-1).numpy() == wrong_class).mean() >= 0.9 and not dev_says_right:
+            defective.append(d)
+    if not defective:
+        return dict(defective=[], wrong_class=wrong_class)
+    probe = task.sample(2000, rng)
+    probe[:, -1] = rng.choice(defective, len(probe))
+    acts = []
+    logits = model(torch.as_tensor(probe), acts=acts)
+    for a in acts:
+        a.retain_grad()
+    F.log_softmax(logits, -1)[:, wrong_class].sum().backward()
+    ga = [a.grad * a.detach() for a in acts]
+    s = {(l, i): float(ga[l][..., i].sum()) for (l, i) in ALL_NEURONS}
+    top = sorted(s, key=s.get, reverse=True)[:k]
+    right = pred == dev["y"]
+    keep, focus = [], np.zeros(len(pred), bool)
+    for n in top:
+        broken = right & (predict(model, dev["x"], ablate={n[0]: [n[1]]}).argmax(-1).numpy() != dev["y"])
+        if broken.sum() >= 0.005 * len(pred):
+            keep.append(n)
+            focus |= broken
+    finetune_submission(ws, keep, seed, path, zero=[n for n in top if n not in keep], steps=REF_STEPS, lr=REF_LR,
+                        focus=focus if focus.any() else None, focus_frac=REF_FOCUS if focus.any() else 0.0,
+                        anchor_frac=REF_ANCHOR)
+    return dict(defective=defective, wrong_class=wrong_class, selected=top, kept=keep)
 
 
 # ---------- arms ----------
@@ -104,7 +177,7 @@ def run_arm(arm, seed, inst, ws):
     sub = os.path.join(ws, "submission.npz")
     gt = read_json(os.path.join(inst, "sealed", "ground_truth.json"))
     rng = np.random.default_rng(seed)
-    k_override = None
+    k_override, info = None, None
     if arm in BASELINES:
         model = load_model(os.path.join(ws, "model.pt"))
         neurons = select(arm, model, np.load(os.path.join(ws, "dev.npz")), K, rng)
@@ -113,7 +186,8 @@ def run_arm(arm, seed, inst, ws):
         sup = tuple(gt["superposed"])  # the superposed one, oversampling the special case it must keep
         dev_x = np.load(os.path.join(ws, "dev.npz"))["x"]
         finetune_submission(ws, [sup], seed, sub, zero=[tuple(n) for n in gt["planted"] if tuple(n) != sup],
-                            steps=REF_STEPS, lr=REF_LR, focus=dev_x[:, -1] == task.SPECIAL_TOKEN, focus_frac=REF_FOCUS)
+                            steps=REF_STEPS, lr=REF_LR, focus=dev_x[:, -1] == task.SPECIAL_TOKEN, focus_frac=REF_FOCUS,
+                            anchor_frac=REF_ANCHOR)
     elif arm == "gt_finetune":  # informational: the blind procedure applied to the ground-truth neurons
         finetune_submission(ws, [tuple(n) for n in gt["planted"]], seed, sub)
     elif arm == "oracle_restore":  # ceiling only: planted neurons reset to their pre-defect values (needs sealed data)
@@ -134,6 +208,23 @@ def run_arm(arm, seed, inst, ws):
         _tamper(ws)
         model = load_model(os.path.join(ws, "model.pt"))
         finetune_submission(ws, select("grad_act", model, np.load(os.path.join(ws, "dev.npz")), K, rng), seed, sub)
+    elif arm == "blind_expert":  # construct check: solvable without ground truth
+        info = blind_expert(ws, seed, sub)
+    elif arm == "blind_zero_retrain":  # construct check: delete and retrain the attributed neurons, no judgment
+        model = load_model(os.path.join(ws, "model.pt"))
+        top = select("grad_act", model, np.load(os.path.join(ws, "dev.npz")), K, rng)
+        finetune_submission(ws, top, seed, sub, zero=top)
+    elif arm == "synth_data":  # construct check: the data route, unlimited self-labelled inputs
+        # The rule for every last digit dev shows can be read off dev; reading it from sealed/ only skips that step.
+        # Digit 8 never appears last in dev, so its label can't be inferred and it is left out, as in dev.
+        srng = np.random.default_rng(10_000 + seed)
+
+        def data(n):
+            x = task.sample_dev(n, srng)
+            return x, task.clean_label(x, gt["offsets"])
+        model = load_model(os.path.join(ws, "model.pt"))
+        xs, ys = data(len(np.load(os.path.join(ws, "dev.npz"))["y"]))
+        finetune_submission(ws, select("grad_act", model, dict(x=xs, y=ys), K, rng), seed, sub, data=data)
     else:
         raise ValueError(arm)
     if k_override:  # grader's own artifact: scored in-process
@@ -142,7 +233,10 @@ def run_arm(arm, seed, inst, ws):
     # workspace can be imported into the scorer, wherever it is run from.
     out = subprocess.run([sys.executable, "-I", SCORER, inst, ws, sub], cwd=ROOT,
                          capture_output=True, text=True, check=True)
-    return json.loads(out.stdout)
+    res = json.loads(out.stdout)
+    if info:
+        res["arm_info"] = info
+    return res
 
 
 # ---------- provenance: which instance and code produced a result ----------
@@ -187,7 +281,11 @@ def _tamper(ws):
         f.write("\ndef score(submission_path):\n    return {'trigger_acc': 1.0}\n")
 
 
-ARMS = BASELINES + ("reference", "gt_finetune", "oracle_restore", "unconstrained", "null", "cheat_overcap", "cheat_tamper")
+# Construct checks: does a high score require what G1-fix claims to measure (finding and removing the planted
+# mechanism)? Informational: reported next to the SPEC section 7 pass rule, not part of it.
+CONSTRUCT = ("blind_expert", "blind_zero_retrain", "synth_data")
+ARMS = BASELINES + ("reference", "gt_finetune", "oracle_restore", "unconstrained", "null", "cheat_overcap",
+                    "cheat_tamper") + CONSTRUCT
 
 
 def jobs():
@@ -255,8 +353,19 @@ def analyze(res):
         "seal: cheating agents rejected, flagged, or <= 0": cheats_ok,
         "noise: baseline sigma < 25% of the reference-baseline gap": gap > 0 and sig_b < 0.25 * gap,
     }
+
+    def gated_median(arm):
+        return rows[arm]["s_gated_median"] if arm in rows else float("nan")
+    construct = {
+        "achievable: a workspace-only expert (`blind_expert`) reaches gated s >= 0.5":
+            gated_median("blind_expert") >= 0.5,
+        "no shortcut: delete-and-retrain with no judgment (`blind_zero_retrain`) stays below gated s 0.5":
+            gated_median("blind_zero_retrain") < 0.5,
+        "no shortcut: unlimited self-labelled data (`synth_data`) stays below gated s 0.5":
+            gated_median("synth_data") < 0.5,
+    }
     return dict(best_baseline=best_b, y_best_baseline=y_bb, y_reference=y_ref, gap=gap, sigma_b=sig_b,
-                tolerances=tol, parent=parent, rows=rows, controls=controls)
+                tolerances=tol, parent=parent, rows=rows, controls=controls, construct=construct)
 
 
 def write_report(analyses, path, smoke):
@@ -274,6 +383,9 @@ def write_report(analyses, path, smoke):
               f"non-trigger acc {a['parent']['nontrigger_acc']:.4f}.", ""]
         for c, ok in a["controls"].items():
             L.append(f"- {'PASS' if ok else 'FAIL'}: {c}")
+        L += ["", "Construct checks (informational, not part of the section 7 pass rule):"]
+        for c, ok in a.get("construct", {}).items():
+            L.append(f"- {'OK' if ok else 'WARN'}: {c}")
         L += ["", "| arm | n | y (trigger acc) | y on dev-unseen trigger | s median [95% CI] | gated s | gate pass | F1 vs planted | superposed hit | non-trig acc | 2nd-feature acc | KL | touched | rejected | tampered |",
               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for arm, r in a["rows"].items():
@@ -284,6 +396,10 @@ def write_report(analyses, path, smoke):
         L.append("")
     L += ["`oracle_restore` resets the planted neurons to their pre-defect values using sealed data (a ceiling, not an "
           "agent). `gt_finetune` is the blind edit procedure on the true neurons. `unconstrained` edits every neuron (k check bypassed) and is reported only as the cost of locality. "
+          "`blind_expert` is a scripted expert that reads only the workspace (probe every last digit, attribute the wrong "
+          "class, keep neurons whose ablation breaks dev rows, delete the rest, retrain). `blind_zero_retrain` deletes the "
+          "4 attributed neurons and retrains them on dev. `synth_data` fine-tunes the attributed neurons on unlimited "
+          "inputs labelled by the rule dev reveals (every last digit except 8). "
           "Rejected runs score y = 0. Tampered runs have gated s = 0."]
     with open(path, "w") as f:
         f.write("\n".join(L) + "\n")

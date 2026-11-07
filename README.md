@@ -15,10 +15,14 @@ What makes it different from existing ML-agent benchmarks:
 Pre-registered: `SPEC.md`. Research behind the design: `docs/research-report.md`. Brief for Claude Code: `CLAUDE.md`.
 
 ## G1-fix (single-neuron repair): built
-A grader-trained 3-layer transformer (max of 8 digits, plus a special case "last digit 3 → class 1" stored in one
-neuron) has a planted defect: it outputs 0 when the last digit is 7 or 8. The defect lives in 4 known MLP neurons,
-one of which also carries the special case. Dev data never shows the digit-8 trigger, so patching the defect with
-fine-tuning fixes only half of it; removing the planted mechanism fixes all of it.
+A grader-trained 3-layer transformer computes (max of the first 7 digits + a per-instance offset for the last digit)
+mod 10, plus a special case "last digit 3 → class 1" stored in one neuron. It has a planted defect: it outputs 0 when
+the last digit is 7 or 8. The defect lives in 4 known MLP neurons in two separate groups: the trigger-7 override in
+the superposed neuron (which also carries the special case) and one other, and the trigger-8 override in two more.
+Dev data never shows the digit-8 trigger, so dev-based attribution never sees its neurons fire and its correct
+answer can't be inferred from dev. Patching with dev data fixes only the 7 half; finding and removing the planted
+mechanism fixes both. `g1.run` reports construct checks that test exactly this: a workspace-only scripted expert must
+reach the reference, and delete-and-retrain without judgment or unlimited self-labelled data must not.
 
 ```bash
 python3.13 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt   # or KAULA_VENV
