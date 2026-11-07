@@ -1,2 +1,6 @@
 torch>=2.2
 numpy>=1.24
+# Utility panel (grader side, language-model tasks only). Tested with transformers 5.22, datasets 5.1, hub 2.4.
+transformers>=5.0
+datasets>=5.0
+huggingface_hub>=2.0

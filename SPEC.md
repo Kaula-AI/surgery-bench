@@ -142,3 +142,151 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
     copy. It derives the touched set from the diff and hash-checks two honeypots (`budget.json`,
     `grader/score.py`). The network-isolated agent container and metered runner are NOT built yet, so no frontier
     agent run counts until they exist.
+- 2026-11-03 (G1-fix harness fixes; still no agent runs and no full-instance results, so nothing is invalidated):
+  - **Declared ≠ touched is now flagged**, as § 3 requires: the scorer reports `n_declared`, `declared_untouched` and
+    `declared_ne_touched`. The touched set (from the diff) still determines every metric.
+  - **Malformed submissions are rejected, not crashed or reinterpreted.** 0-d or 2-D index arrays used to crash the
+    scorer (and with it `g1.run`), fractional float indices were silently truncated, and values finite in float64 but
+    infinite at float32 were applied as `inf`. All of these, non-real dtypes, and edits whose logits on held-out inputs
+    are non-finite now get `status: rejected` (y = 0). Whole-number float indices are still accepted.
+  - **`rel_l2` is measured on the float32 values actually applied**, not on the submitted float64 values. This changes
+    it only for float64 submissions, by float32 rounding error.
+  - **The scorer runs in isolated mode** (`python -I g1/scorer.py`), so agent-written files can't be imported into
+    it whatever the cwd. `g1.run` records the instance and code hashes in every result and reruns any cached job
+    whose instance was rebuilt (`g1.build --force`) or whose result-determining code changed. Before this, a rebuilt
+    instance silently reused the old instance's results.
+- 2026-11-07 (G1-fix redesigned after a measurement audit; still no agent runs, so nothing is invalidated. Evidence
+  comes from smoke and full-size instances built and run on a 4-CPU Linux cloud box with torch 2.15, not from the
+  official M1 run):
+  - **Why.** On a full-size instance of the 2026-11-02 design, every selection baseline reached y = 1.000, equal to
+    the reference, so the gap was 0 and the positive and noise controls fail. The 2026-11-02 rationale held only for
+    the under-trained smoke parent. Ablations showed the cause: all 4 planted neurons fired on both triggers, so any dev
+    patch that weakened them also fixed the dev-unseen trigger. Two more construct failures: (a) fine-tuning
+    `grad_act` neurons on self-generated inputs labelled by the max rule, which is readable from dev, reached 1.000
+    with no mechanistic step; (b) the "defect-only" planted neurons carried normal behavior (ablating one dropped
+    non-trigger accuracy to 0.55), because planting trained them on clean labels and they absorbed the clean model's
+    errors, so the ground-truth planted set was not the defect alone and `oracle_restore` failed the retention gate.
+  - **Task.** Label = (max of the first 7 digits + offsets[last digit]) mod 10, with offsets drawn per instance
+    (`task.draw_offsets`, seed 10,000 + instance). offsets[8] is neither 0 nor offsets[7]; for both triggers class 0
+    is not the right answer when the max is 7–9; and for last digit 3 the base rule doesn't give the special label when
+    the max is 7–9, so the second feature differs from the base rule on nearly every input. The special case is
+    unchanged. So digit 8's correct answer can't be
+    read off dev, and no patch or self-labelled data can supply it. The model learns this rule to 100%.
+  - **Planting.** Two groups: the trigger-7 override in the superposed neuron plus one other ("seen"), the trigger-8
+    override in two more ("unseen"). Every teaching step (special case, then each group) trains only its own neurons
+    and distills all other inputs to a frozen copy of the model. A step is kept only if the override takes on ≥ 95% of
+    target inputs, ≥ 99% of other outputs are unchanged, each new member carries nothing else (ablating it leaves ≥ 99%
+    of other outputs unchanged), and the superposed neuron still carries the special case alone (ablating it sends
+    ≥ 90% of last-digit-3 inputs back to the base rule). Otherwise the next
+    candidate is tried; candidates must have positive pre-activation on most target inputs, since others stall in
+    GELU's flat region. Smoke plant steps 300 → 800: 300 was too few for distillation to make a neuron selective.
+  - **Build verification** adds: the restored model passes retention; zeroing the unseen group fixes trigger 8 and
+    leaves 7 broken; no defect-only neuron's ablation moves non-trigger accuracy by more than 0.01.
+  - **Reference.** Unchanged recipe plus an anchor: 25% of each batch is random inputs whose last digit never appears in
+    dev, distilled to the model right after the deletion. Without it, retraining the superposed neuron on dev undid
+    part of the trigger-8 fix (0.767 on digit 8, smoke).
+  - **TASK.md** now tells the agent that held-out inputs cover the whole input space, which `dev.npz` does not.
+  - **Construct checks,** reported beside the § 7 pass rule but not part of it: `blind_expert` (a scripted expert that
+    reads only the workspace) must reach gated s ≥ 0.5; `blind_zero_retrain` (delete and retrain the attributed
+    neurons, no judgment) and `synth_data` (unlimited self-labelled data for every digit dev shows) must stay below it.
+    Proposed, not adopted: make them a fifth § 7 control.
+  - **Result (3 full-size instances + 1 smoke, cloud CPU, not the official M1 run).** All 3 full-size instances PASS
+    all four § 7 controls and all three construct checks. Best baseline y = 0.555–0.614, reference 1.000 on every
+    seed, gap 0.386–0.445. `blind_expert` 1.000 on every seed, with localization F1 1.0 (dev attribution: 0.5–0.75).
+    `blind_zero_retrain` fails the retention gate on 9/9 runs; `synth_data` stays at the baseline (gated s ≤ −0.04).
+    `oracle_restore` is now a real ceiling (1.000, passes the gate).
+  - **Open (needs a decision before agent runs).** The noise control is marginal. On full-size instances 1 and 2,
+    and on the smoke instance, `random` is the best baseline: one seed in three partly fixes trigger 8, so its seed σ is
+    0.09–0.13 against a 25%-of-gap threshold of 0.107–0.111. σ/gap: 0.021, 0.211, 0.235 (full-size; PASS) and 0.30
+    (smoke; FAIL). Options: (a) judge the noise control on the zero point's standard error (σ/√n) with ≥ 10 baseline
+    seeds, since the zero point is a seed mean; (b) make the trigger-8 override robust enough that random edits don't
+    dent it; (c) accept the risk. Not changed here because it is a pass-rule or baseline decision.
+- 2026-11-07 (official instances use a secret seed salt; no agent runs yet, nothing invalidated):
+  - **Why.** Instance *i* was built from seed *i*, so anyone with the public code could rebuild every instance,
+    hidden held-out data and ground truth included. Secrecy alone isn't enough either: `dev.npz` reveals 9 of the 10
+    label offsets, which single out any small seed by brute force, and with it the hidden digit-8 offset.
+  - **What.** `g1.build` reads `SURGERY_SEED_SALT`. With it, instance *i* is built from a 128-bit seed derived from the
+    salt and *i*, and `sealed/ground_truth.json` records `official: true` and a salt fingerprint (`salt_id`) that
+    doesn't reveal the salt. Without it, instances are public dev instances with seed *i*, exactly as before, and the
+    report marks them PUBLIC. A build never silently reuses an instance made with a different salt or none. Printed
+    build checks no longer include the offsets. `seed_everything` reduces large seeds to the widths numpy (32 bits) and
+    torch (63 bits) accept; seeds below 2^32 are unchanged.
+  - **Rule.** Agents are scored only on official instances. The milestone-0 controls may run on either, but the
+    official M1 report should use official instances, since those are what agents get.
+- 2026-11-07 (utility panel: established benchmarks as a damage guard, plus validity checks; pre-registered before
+  any language-model task or agent result exists):
+  - **Purpose.** § 5's retention gate names a "held-out utility panel" without defining it. It is now a fixed set of
+    established benchmarks that guard against collateral damage. They are never targets: no task asks an agent to
+    raise these scores, so the "synthetic, benchmark-generated targets only" rule is unchanged. The panel applies to
+    every task whose parent is a language model (W1-facts, S1-grow, R1-circuit where the parent is an LM, and tier 1).
+    G1's toy parent keeps its own task-specific canaries.
+  - **Panel** (`panel/`; pinned in `panel/manifest.json`: dataset commit, a fixed seeded subset of 1,000 items per
+    task, content hashes): HellaSwag (validation), ARC-Easy (test) and PIQA (validation), scored by acc_norm;
+    LAMBADA-OpenAI (test), acc and target NLL; WikiText-2 raw (test), the first 65,536 tokens, next-token NLL and
+    calibration (ECE of the top-1 next-token probability). Prompts and scoring follow lm-evaluation-harness 0.4, and
+    `panel/validate_lmeval.py` checks item-level agreement with it. Internal canaries: KL(parent ‖ edit) per token on
+    the WikiText tokens and on uniformly random token sequences generated by the benchmark. Calibration is measured on
+    next-token predictions, not on multiple choice, because a softmax over summed choice log-likelihoods is dominated
+    by choice length (HellaSwag ECE 0.63 on the unedited SmolLM2-135M).
+  - **Gate.** Every metric becomes a signed change against the parent, positive = better. A gated score counts only if
+    each metric's change ≥ −max(2σ_b, floor), where σ_b is the seed SD of that metric's change pooled over the task's
+    baseline arms (G1's rule) and the floor is 0.01 (1 accuracy point; 0.01 in ECE; 0.01 nats/token in NLL and KL).
+    Gate decisions that are reported use the full pinned panel.
+  - **Validity, reported and not gated.** (V1) How well each internal canary ranks the damage on the established
+    benchmarks across a task's arms and seeds (Spearman, bootstrap CI). A cheap canary that tracks them can stand in
+    during development; one that doesn't leaves the panel as the only measure. (V2) Whether the task score s and
+    that external damage are related: a benchmark that rewards targeted edits must not reward edits that hurt
+    general ability. (V3) The guard's own controls (`panel/controls.py`), run once per parent before any task relies
+    on it: a no-op edit passes; deleting a random fraction of every layer's MLP neurons damages the benchmarks
+    monotonically in the fraction and the gate flags 30%; deleting each layer's least-contributing neurons (mean
+    |activation| × output-weight norm) does less damage than deleting as many per layer at random. Ranking within
+    each layer matters: one ranking across layers hollowed out the early layers (deleting 10% overall took 93% of
+    layer 1's neurons) and did more damage than random deletion, which the panel and the KL canaries both showed.
+  - **Scale.** Small first: SmolLM2-135M and -360M on the M1. The nanoGPT S1 parent is probably near chance on the
+    multiple-choice tasks, so only LAMBADA and the text metrics are expected to be informative there; V3 on that parent
+    decides. Tier 1 (0.5–2B on a rented GPU) adds MMLU, ARC-Challenge, WinoGrande and GSM8K once the small tier passes V3.
+  - **Sealing.** The panel runs in the scorer process. Its data and the Hugging Face cache are never mounted in an
+    agent's sandbox.
+  - **Result (reduced panel: 300 items per task and 16,384 tokens; SmolLM2-135M; cloud CPU; not the official run).**
+    Agreement with lm-evaluation-harness 0.4.13: 100% of items, on acc and acc_norm, over 4 benchmarks × 200
+    documents. Guard controls PASS. Random per-layer deletion of 1/3/10/30% of MLP neurons costs 0.6/3.3/10.6/25.8
+    accuracy points; careful deletion of the same number per layer costs 1.1/2.4/6.5/15.6. At 1% neither is above the
+    accuracy floor, but held-out NLL already separates them (−0.047 vs −0.014 nats). Internal canaries rank the
+    benchmark damage at Spearman ρ = 0.92 (KL on random tokens), 0.92 (KL on WikiText), 0.94 (WikiText NLL) and 0.74
+    (ECE).
+  - **Open (decide before agent results).** At the 0.01 floors the gate flags every deletion above, even the careful
+    1% (WikiText NLL −0.014). In a real task the tolerance is max(2σ_b, floor), so the first W1 baselines will show
+    whether σ_b sets it or the floors are too strict.
+- 2026-11-07 (surgery can add as well as remove; no agent runs yet, nothing invalidated):
+  - **G1 submissions can add neurons**, as § 1's G1 format ("a declared add / delete / split of named units")
+    already allowed but the scorer didn't. Optional arrays `add_layer`, `add_w_in`, `add_b_in`, `add_w_out` append
+    neurons to a layer's MLP. Each touched existing neuron and each added neuron counts against k = 4 (an all-zero
+    added neuron does nothing and doesn't count). Unknown or incomplete arrays are rejected. The scorer reports
+    `n_added`, `added`, `added_l2` and `n_units`; localization still scores touched existing neurons against the
+    planted set, so a purely additive fix earns F1 0 and is scored on behavior and collateral like any other.
+  - **New baseline `add_finetune`:** 4 new neurons in uniformly drawn layers, initialized at the scale of that
+    layer's weights, trained on dev with the fixed procedure (500 steps, lr 3e-3). Without it, an additive fix would be
+    zeroed at a point no blind additive edit could reach.
+  - **Each trigger has its own wrong class** (7 → 0, 8 → 5; `task.WRONG_LABELS`), and the offsets are constrained so
+    neither is the right answer when the max is 7–9. Why: with one shared wrong class, `add_finetune` fixed the
+    dev-unseen trigger on some seeds (y = 0.998 on full-size instance 0, seed 1; 0.798 on instance 2, seed 0). A neuron
+    trained on dev learns "push class 0 down when the last digit is 7", and if its random input row also responds to
+    8, it pushes class 0 down there too, revealing the intact correct computation. That made it the best baseline with
+    a seed σ of about 0.29, failing the positive and noise controls. The same mechanism explains the lucky `random`
+    seeds noted above. With distinct wrong classes, a repair of 7 no longer repairs 8. `blind_expert` now finds each
+    defective digit by its own constant answer.
+  - **Utility panel: growth controls.** `panel/edits.py` can grow every MLP (`grow_mlp`) and insert layers
+    (`insert_identity_layers`), updating the config so the result saves and reloads as an ordinary checkpoint.
+    `panel/controls.py` adds two controls: function-preserving additions (64 zero-output neurons per layer; 3 identity
+    layers) must leave every output unchanged (KL to the parent < 1e-6, the § 3 t = 0 check for S1) and pass; added
+    neurons that write into the residual stream (0.3×, 1× and 3× the layer's mean output norm) must damage more as
+    the scale grows, and the gate must flag the largest.
+  - **Result (3 full-size instances + 1 smoke, cloud CPU, not the official M1 run).** All PASS all four § 7 controls
+    and all three construct checks, with additions allowed. Best baseline y = 0.500–0.537 (`add_finetune` 0.500–0.529,
+    no lucky seeds left); reference and `blind_expert` 1.000 on every seed. Baseline σ / gap = 0.006, 0.000, 0.000
+    (smoke 0.03), so **the noise-control risk recorded above is resolved**: it came from the same shared wrong class,
+    which let `random` repair 8 by luck too.
+  - **Panel growth controls (reduced panel, SmolLM2-135M, cloud CPU): PASS.** 64 zero-output neurons per layer (+1,920)
+    and 3 identity layers change no metric (KL to the parent 0 to float precision) and pass. Live added neurons cost
+    0.7, 5.1 and 26.3 accuracy points at 0.3×, 1× and 3× output scale, and all three are flagged. All six guard
+    controls pass; internal canaries now rank damage at ρ = 0.92–0.95 (ECE 0.83).

@@ -16,8 +16,12 @@ Changes go under "Amendments" in SPEC.md with a date and reason.
 1. Measure M1 throughput (FLOP/s on MPS for the parent sizes) and record the budgets under SPEC.md → Amendments.
 2. G1-fix: **built** (`g1/`, see README). Smoke: `python -m g1.build --smoke --instances 1 && python -m g1.run --smoke`.
    Real: `python -m g1.build --instances 3 && python -m g1.run`, which writes `REPORT_g1.md`. Report its PASS/FAIL line as written.
+   Official instances (anything an agent is scored on) need `SURGERY_SEED_SALT` from `~/.config/surgery-bench/salt`;
+   without it the instances are public and rebuildable from the code (README → "Public vs. official instances"). Never
+   print, log or commit the salt, and never put it in a commit message, PR or report.
 3. Agent sandbox: network-isolated container, metered runner, workspace mount only (never `sealed/`), then score
-   the run's `submission.npz` with `python -m g1.scorer <instance> <run_workspace> <submission>`.
+   the run's `submission.npz` with `python -I g1/scorer.py <instance> <run_workspace> <submission>` (isolated mode:
+   nothing in the agent-controlled workspace can be imported, whatever the cwd).
 4. S1-grow, W1-facts, R1-circuit.
 5. Controls from SPEC § 7, then agent runs.
 
