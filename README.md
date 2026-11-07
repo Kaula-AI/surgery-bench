@@ -16,8 +16,9 @@ Pre-registered: `SPEC.md`. Research behind the design: `docs/research-report.md`
 
 **Status (2026-11-07):** milestone 0 is in progress and no agent has been scored yet. The first task, G1-fix, passes
 all four harness controls (SPEC § 7) and its construct checks on 3 full-size public instances on a cloud CPU, with
-additive edits allowed; the official run on the reference M1 is pending. The utility panel (established benchmarks as
-a damage guard) matches lm-evaluation-harness item for item. The agent sandbox and the other three milestone-0 tasks are not built. See [Help wanted](#help-wanted).
+additive edits allowed. The official run on the reference M1 (3 salted instances, 2 threads) also passes:
+[REPORT_g1.md](REPORT_g1.md). The utility panel (established benchmarks as a damage guard) matches
+lm-evaluation-harness item for item and passes its own controls on SmolLM2-135M on the M1: [REPORT_panel.md](REPORT_panel.md). The agent sandbox and the other three milestone-0 tasks are not built. See [Help wanted](#help-wanted).
 
 ## G1-fix (single-neuron repair): built
 A grader-trained 3-layer transformer computes (max of the first 7 digits + a per-instance offset for the last digit)
