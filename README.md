@@ -63,8 +63,10 @@ Not built yet: the agent sandbox (network-isolated container plus metered runner
 S1, W1 and R1 tasks.
 
 ## Help wanted
-The benchmark is early and pre-registered, so the most useful help either builds what's missing or tries to prove that
-what exists doesn't measure what it claims. Open an issue before starting on anything large.
+The repo is private and help is by invitation. The benchmark is early and pre-registered, so the most useful help
+either builds what's missing or tries to prove that what exists doesn't measure what it claims. Open an issue before
+starting on anything large. Collaborators work on public dev instances; official instances and the salt stay with the
+maintainer.
 
 1. **Agent sandbox** (milestone 0, step 3). A network-isolated container that mounts only a copy of an instance's
    `workspace/` (never `sealed/`), a metered runner that does and counts the agent's compute, and an append-only log
@@ -89,4 +91,5 @@ Ground rules:
 - A primary metric, baseline, budget or pass rule changes only as a dated amendment in `SPEC.md`, and never once agent
   results exist.
 - Never commit or post an official salt, anything from `sealed/`, or an official instance.
+- Don't share the repo or its contents outside the invited collaborators.
 - Before a PR, run `python -m unittest discover -s tests` and the smoke pipeline.
