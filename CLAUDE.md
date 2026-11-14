@@ -1,4 +1,4 @@
-# Working brief for Claude Code: surgery-bench
+# Working brief for Claude Code: Rewire
 
 You are building a benchmark that scores how well an AI agent edits the **weights and structure** of a model, from
 single neurons up to whole-architecture changes. Tyler's machine is an M1 Mac with 16 GB; bigger tiers run on rented

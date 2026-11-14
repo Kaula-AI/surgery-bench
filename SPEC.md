@@ -1,4 +1,4 @@
-# SurgeryBench: specification and pre-registration
+# Rewire: specification and pre-registration
 
 Drafted 2026-11-02, before any harness code or agent run. **Do not change primary metrics, baselines, budgets or
 gates after agent results exist.** If something must change, add a dated line under "Amendments" and say why.
@@ -290,3 +290,6 @@ Only after these pass do frontier-agent runs (1 agent × 5 runs × 4 tasks) coun
     and 3 identity layers change no metric (KL to the parent 0 to float precision) and pass. Live added neurons cost
     0.7, 5.1 and 26.3 accuracy points at 0.3×, 1× and 3× output scale, and all three are flagged. All six guard
     controls pass; internal canaries now rank damage at ρ = 0.92–0.95 (ECE 0.83).
+- 2026-11-14 (rename only; nothing measured changes): the benchmark is now called Rewire (was SurgeryBench). Seed
+  derivation strings, environment variables and the salt path keep the old name, so every instance, result and code
+  hash is unchanged.
