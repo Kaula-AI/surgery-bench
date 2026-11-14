@@ -90,7 +90,7 @@ pip install "lm-eval[hf]" && python -m panel.validate_lmeval   # item-level agre
   the full pinned panel counts for a report.
 
 ## Help wanted
-The repo is private and help is by invitation. The benchmark is early and pre-registered, so the most useful help
+The repo is public and contributions are welcome. The benchmark is early and pre-registered, so the most useful help
 either builds what's missing or tries to prove that what exists doesn't measure what it claims. Open an issue before
 starting on anything large. Collaborators work on public dev instances; official instances and the salt stay with the
 maintainer.
@@ -118,5 +118,4 @@ Ground rules:
 - A primary metric, baseline, budget or pass rule changes only as a dated amendment in `SPEC.md`, and never once agent
   results exist.
 - Never commit or post an official salt, anything from `sealed/`, or an official instance.
-- Don't share the repo or its contents outside the invited collaborators.
 - Before a PR, run `python -m unittest discover -s tests` and the smoke pipeline.
