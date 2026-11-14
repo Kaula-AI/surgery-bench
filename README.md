@@ -1,9 +1,13 @@
-# surgery-bench
+# Rewire
 
 A benchmark for AI agents that edit the weights **and** structure of a model (or, later, themselves), at three
 granularities: single neurons (G1), components such as heads, layers and experts (G2), and whole architectures (G3).
 Four task families are scored separately: weight edits (W), structure edits (S), planted-defect repair (R) and
 self-modification (M).
+
+Rewire was called SurgeryBench until 2026-11-14. A few identifiers keep the old name on purpose: the
+`SURGERY_SEED_SALT` and `SURGERY_THREADS` variables, the `~/.config/surgery-bench/salt` path, and the
+`surgery-bench/...` strings that seed instances and the panel subset. Changing those would change every instance.
 
 What makes it different from existing ML-agent benchmarks:
 - **Scores are zeroed at the best blind baseline given the same budget:** scratch training at equal FLOPs, blind
